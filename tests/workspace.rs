@@ -1,0 +1,153 @@
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use heimr::Workspace;
+
+static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+fn temporary_directory() -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "heimr-test-{timestamp}-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&path).unwrap();
+    path
+}
+
+#[test]
+fn stable_work_and_multiple_dispatches_are_independent() {
+    let temp = temporary_directory();
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.set_work(b"do the work\n").unwrap();
+    assert!(workspace.set_work(b"replace it").is_err());
+    workspace.new_dispatch("build").unwrap();
+    workspace.new_dispatch("review").unwrap();
+    workspace
+        .put_dispatch_file(
+            "build",
+            PathBuf::from("AGENTS.md").as_path(),
+            b"build instructions",
+        )
+        .unwrap();
+    workspace
+        .put_dispatch_file(
+            "review",
+            PathBuf::from("AGENTS.md").as_path(),
+            b"review instructions",
+        )
+        .unwrap();
+    workspace.seal_dispatch("build").unwrap();
+    fs::write(
+        workspace
+            .dispatch_path("build")
+            .unwrap()
+            .join("HANDOFF.json"),
+        "{\"status\": \"completed\"}\n",
+    )
+    .unwrap();
+    workspace.check().unwrap();
+    assert!(
+        workspace
+            .put_dispatch_file("build", PathBuf::from("extra").as_path(), b"no")
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.dispatch_path("review").unwrap().join("AGENTS.md")).unwrap(),
+        "review instructions"
+    );
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn rejects_escape_paths_and_detects_modified_sealed_content() {
+    let temp = temporary_directory();
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.new_dispatch("build").unwrap();
+    assert!(
+        workspace
+            .put_dispatch_file("build", PathBuf::from("../AGENTS.md").as_path(), b"bad")
+            .is_err()
+    );
+    assert!(
+        workspace
+            .put_dispatch_file("build", PathBuf::from("dispatch.json").as_path(), b"bad")
+            .is_err()
+    );
+    workspace
+        .put_dispatch_file(
+            "build",
+            PathBuf::from("nested/AGENTS.md").as_path(),
+            b"good",
+        )
+        .unwrap();
+    workspace
+        .put_dispatch_file(
+            "build",
+            PathBuf::from("nested/HANDOFF.json").as_path(),
+            b"tracked",
+        )
+        .unwrap();
+    workspace.seal_dispatch("build").unwrap();
+    workspace.check().unwrap();
+    fs::write(
+        workspace
+            .dispatch_path("build")
+            .unwrap()
+            .join("nested/HANDOFF.json"),
+        b"changed",
+    )
+    .unwrap();
+    assert!(
+        workspace
+            .check()
+            .unwrap_err()
+            .contains("inventory does not match")
+    );
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_dispatch_paths_through_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let temp = temporary_directory();
+    let outside = temporary_directory();
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.new_dispatch("build").unwrap();
+    symlink(
+        &outside,
+        workspace.dispatch_path("build").unwrap().join("escape"),
+    )
+    .unwrap();
+    assert!(
+        workspace
+            .put_dispatch_file("build", PathBuf::from("escape/AGENTS.md").as_path(), b"bad")
+            .unwrap_err()
+            .contains("symlink")
+    );
+    assert!(!outside.join("AGENTS.md").exists());
+    fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn cli_uses_the_configured_root() {
+    let root = temporary_directory();
+    let output = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["--root", root.to_str().unwrap(), "new", "demo"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert!(root.join("demo").is_dir());
+    fs::remove_dir_all(root).unwrap();
+}

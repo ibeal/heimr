@@ -1,0 +1,15 @@
+[package]
+name = "heimr"
+version = "0.1.0"
+edition = "2024"
+description = "Durable, tool-agnostic agent workspaces"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "heimr"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
