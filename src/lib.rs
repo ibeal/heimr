@@ -69,6 +69,34 @@ impl Workspace {
         validate_worktree(&self.repository_path())
     }
 
+    pub fn prepare_repository_url(&self, url: &str) -> Result<()> {
+        self.require_exists()?;
+        if self.repository_path().exists() {
+            return validate_worktree(&self.repository_path());
+        }
+
+        let staging = self.create_clone_staging_directory()?;
+        let clone = staging.join("repository");
+        let result = (|| {
+            run_git(
+                Command::new("git").args(["clone", url]).arg(&clone),
+                "git clone failed",
+            )?;
+            run_git(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&clone)
+                    .args(["switch", "--detach"]),
+                "git checkout failed",
+            )?;
+            validate_worktree(&clone)?;
+            fs::rename(&clone, self.repository_path()).map_err(io_error)
+        })();
+        let cleanup = fs::remove_dir_all(&staging).map_err(io_error);
+        result?;
+        cleanup
+    }
+
     pub fn new_dispatch(&self, name: &str) -> Result<()> {
         self.require_exists()?;
         let path = self.dispatch_path(name)?;
@@ -154,6 +182,22 @@ impl Workspace {
         } else {
             Err(format!("workspace does not exist: {}", self.root.display()))
         }
+    }
+
+    fn create_clone_staging_directory(&self) -> Result<PathBuf> {
+        for _ in 0..100 {
+            let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = self.root.join(format!(
+                ".repository-clone-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Err("could not create a unique repository clone staging directory".to_owned())
     }
     fn require_unsealed_dispatch(&self, name: &str) -> Result<PathBuf> {
         let path = self.dispatch_path(name)?;
@@ -244,6 +288,20 @@ fn validate_worktree(path: &Path) -> Result<()> {
             "repository is not a valid Git worktree: {}",
             path.display()
         ))
+    }
+}
+
+fn run_git(command: &mut Command, context: &str) -> Result<()> {
+    let output = command.output().map_err(io_error)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if detail.is_empty() {
+            Err(context.to_owned())
+        } else {
+            Err(format!("{context}: {detail}"))
+        }
     }
 }
 

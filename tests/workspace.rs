@@ -167,6 +167,131 @@ fn cli_defaults_to_a_heimr_directory_in_home() {
 }
 
 #[test]
+fn cli_prepares_a_detached_repository_from_a_url() {
+    let temp = temporary_directory();
+    let source = temp.join("source");
+    let remote = temp.join("remote.git");
+    run_git(&temp, ["init", source.to_str().unwrap()]);
+    run_git(&source, ["config", "user.email", "heimr@example.test"]);
+    run_git(&source, ["config", "user.name", "Heimr Test"]);
+    fs::write(source.join("README.md"), "source\n").unwrap();
+    run_git(&source, ["add", "README.md"]);
+    run_git(&source, ["commit", "-m", "initial"]);
+    run_git(
+        &temp,
+        [
+            "clone",
+            "--bare",
+            source.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+
+    let binary = env!("CARGO_BIN_EXE_heimr");
+    assert!(
+        Command::new(binary)
+            .args(["--root", temp.to_str().unwrap(), "new", "task"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let prepared = Command::new(binary)
+        .args([
+            "--root",
+            temp.to_str().unwrap(),
+            "repo",
+            "prepare",
+            "task",
+            "--url",
+            remote.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(prepared.status.success(), "{prepared:?}");
+    let repository = temp.join("task/repository");
+    assert_eq!(
+        fs::read_to_string(repository.join("README.md")).unwrap(),
+        "source\n"
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .status()
+            .unwrap()
+            .code()
+            .is_some_and(|code| code != 0)
+    );
+
+    assert!(
+        Command::new(binary)
+            .args(["--root", temp.to_str().unwrap(), "new", "failed"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let failed = Command::new(binary)
+        .args([
+            "--root",
+            temp.to_str().unwrap(),
+            "repo",
+            "prepare",
+            "failed",
+            "--url",
+            temp.join("missing.git").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(
+        String::from_utf8(failed.stderr)
+            .unwrap()
+            .contains("git clone failed")
+    );
+    assert!(!temp.join("failed/repository").exists());
+    assert!(fs::read_dir(temp.join("failed")).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".repository-clone-")
+    }));
+
+    let invalid = Command::new(binary)
+        .args([
+            "--root",
+            temp.to_str().unwrap(),
+            "repo",
+            "prepare",
+            "failed",
+            "--from",
+            source.to_str().unwrap(),
+            "--url",
+            remote.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(
+        String::from_utf8(invalid.stderr)
+            .unwrap()
+            .contains("exactly one of --from or --url is required")
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+}
+
+fn run_git<const N: usize>(directory: &std::path::Path, args: [&str; N]) {
+    let status = Command::new("git")
+        .current_dir(directory)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
 fn help_and_docs_do_not_require_a_workspace_root() {
     let help = Command::new(env!("CARGO_BIN_EXE_heimr"))
         .arg("help")

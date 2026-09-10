@@ -10,6 +10,8 @@ Run `heimr help` to list commands. `heimr docs` prints the agent-facing workspac
 heimr --root /workspaces new ask-2026-09-02
 heimr --root /workspaces work set ask-2026-09-02 --from work.md
 heimr --root /workspaces repo prepare ask-2026-09-02 --from /checkout
+# or clone a remote repository
+heimr --root /workspaces repo prepare ask-2026-09-02 --url https://github.com/example/project.git
 heimr --root /workspaces dispatch new ask-2026-09-02 build
 heimr --root /workspaces dispatch put ask-2026-09-02 build --path AGENTS.md --from build-agents.md
 heimr --root /workspaces dispatch seal ask-2026-09-02 build

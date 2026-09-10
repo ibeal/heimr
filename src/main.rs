@@ -75,10 +75,15 @@ fn run() -> Result<(), String> {
         "repo" => {
             require_word(&mut args, "prepare")?;
             let name = take(&mut args)?;
-            let from =
-                option(&mut args, "--from").ok_or_else(|| "--from is required".to_owned())?;
+            let from = option(&mut args, "--from");
+            let url = option(&mut args, "--url");
             reject_extra(&args)?;
-            Workspace::open(&root, &name)?.prepare_repository(Path::new(&from))?;
+            let workspace = Workspace::open(&root, &name)?;
+            match (from, url) {
+                (Some(from), None) => workspace.prepare_repository(Path::new(&from))?,
+                (None, Some(url)) => workspace.prepare_repository_url(&url)?,
+                _ => return Err("exactly one of --from or --url is required".to_owned()),
+            }
         }
         "dispatch" => dispatch(&root, args)?,
         _ => return Err(usage()),
@@ -158,12 +163,12 @@ fn usage() -> String {
 
 fn print_help() {
     println!(
-        "Heimr manages durable, tool-agnostic agent workspaces.\n\nUsage: heimr [--root <path>] <command> ...\n\nCommands:\n  new <workspace>\n  list\n  path <workspace>\n  show <workspace>\n  check <workspace>\n  work set <workspace> [--from <path>]\n  repo prepare <workspace> --from <checkout>\n  dispatch new <workspace> <dispatch>\n  dispatch put <workspace> <dispatch> --path <path> [--from <path>]\n  dispatch seal <workspace> <dispatch>\n  docs\n  help\n\nWorkspace commands default to ~/.heimr. Set HEIMR_ROOT or pass --root to override it."
+        "Heimr manages durable, tool-agnostic agent workspaces.\n\nUsage: heimr [--root <path>] <command> ...\n\nCommands:\n  new <workspace>\n  list\n  path <workspace>\n  show <workspace>\n  check <workspace>\n  work set <workspace> [--from <path>]\n  repo prepare <workspace> (--from <checkout> | --url <git-url>)\n  dispatch new <workspace> <dispatch>\n  dispatch put <workspace> <dispatch> --path <path> [--from <path>]\n  dispatch seal <workspace> <dispatch>\n  docs\n  help\n\nWorkspace commands default to ~/.heimr. Set HEIMR_ROOT or pass --root to override it."
     );
 }
 
 fn print_docs() {
     println!(
-        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>`.\n4. Create a dispatch, add its inputs, then seal it.\n5. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and every sealed dispatch are immutable through Heimr. Sealing writes `HANDOFF.json` and a SHA-256 inventory in `dispatch.json`; `check` verifies that inventory."
+        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Create a dispatch, add its inputs, then seal it.\n5. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and every sealed dispatch are immutable through Heimr. Sealing writes `HANDOFF.json` and a SHA-256 inventory in `dispatch.json`; `check` verifies that inventory."
     );
 }
