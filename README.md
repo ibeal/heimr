@@ -2,7 +2,9 @@
 
 Heimr is a durable, tool-agnostic CLI for agent workspaces. It stores work and dispatch inputs; it does not invoke agents, resolve contexts, or manage sandboxing.
 
-Set `HEIMR_ROOT`, or pass `--root <directory>` to every command.
+Workspaces are stored in `~/.heimr` by default. Set `HEIMR_ROOT`, or pass `--root <directory>` to override it.
+
+Run `heimr help` to list commands. `heimr docs` prints the agent-facing workspace lifecycle and its invariants; neither command requires a workspace root.
 
 ```sh
 heimr --root /workspaces new ask-2026-09-02

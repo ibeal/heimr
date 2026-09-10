@@ -151,3 +151,38 @@ fn cli_uses_the_configured_root() {
     assert!(root.join("demo").is_dir());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn cli_defaults_to_a_heimr_directory_in_home() {
+    let home = temporary_directory();
+    let output = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["new", "demo"])
+        .env_remove("HEIMR_ROOT")
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(home.join(".heimr/demo").is_dir());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn help_and_docs_do_not_require_a_workspace_root() {
+    let help = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .arg("help")
+        .output()
+        .unwrap();
+    assert!(help.status.success(), "{help:?}");
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("Commands:"));
+    assert!(help.contains("docs"));
+
+    let docs = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .arg("docs")
+        .output()
+        .unwrap();
+    assert!(docs.status.success(), "{docs:?}");
+    let docs = String::from_utf8(docs.stdout).unwrap();
+    assert!(docs.starts_with("# Agent Usage"));
+    assert!(docs.contains("heimr check <workspace>"));
+}
