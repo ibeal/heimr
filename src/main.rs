@@ -1,4 +1,5 @@
 use std::env;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use heimr::{Workspace, list_workspaces, read_input};
@@ -117,6 +118,13 @@ fn dispatch(root: &Path, mut args: Vec<String>) -> Result<(), String> {
             println!("{}", workspace.seal_dispatch(&dispatch_name)?.display());
             Ok(())
         }
+        "handoff" => {
+            reject_extra(&args)?;
+            io::stdout()
+                .write_all(&workspace.handoff(&dispatch_name)?)
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
         _ => Err(usage()),
     }
 }
@@ -163,12 +171,12 @@ fn usage() -> String {
 
 fn print_help() {
     println!(
-        "Heimr manages durable, tool-agnostic agent workspaces.\n\nUsage: heimr [--root <path>] <command> ...\n\nCommands:\n  new <workspace>\n  list\n  path <workspace>\n  show <workspace>\n  check <workspace>\n  work set <workspace> [--from <path>]\n  repo prepare <workspace> (--from <checkout> | --url <git-url>)\n  dispatch new <workspace> <dispatch>\n  dispatch put <workspace> <dispatch> --path <path> [--from <path>]\n  dispatch seal <workspace> <dispatch>\n  docs\n  help\n\nWorkspace commands default to ~/.heimr. Set HEIMR_ROOT or pass --root to override it."
+        "Heimr manages durable, tool-agnostic agent workspaces.\n\nUsage: heimr [--root <path>] <command> ...\n\nCommands:\n  new <workspace>\n  list\n  path <workspace>\n  show <workspace>\n  check <workspace>\n  work set <workspace> [--from <path>]\n  repo prepare <workspace> (--from <checkout> | --url <git-url>)\n  dispatch new <workspace> <dispatch>\n  dispatch put <workspace> <dispatch> --path <path> [--from <path>]\n  dispatch seal <workspace> <dispatch>\n  dispatch handoff <workspace> <dispatch>\n  docs\n  help\n\nWorkspace commands default to ~/.heimr. Set HEIMR_ROOT or pass --root to override it."
     );
 }
 
 fn print_docs() {
     println!(
-        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Create a dispatch, add its inputs, then seal it.\n5. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and every sealed dispatch are immutable through Heimr. Sealing writes `HANDOFF.json` and a SHA-256 inventory in `dispatch.json`; `check` verifies that inventory."
+        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Create a dispatch, add its inputs, then seal it.\n5. An orchestrator can consume its sealed handoff with `heimr dispatch handoff <workspace> <dispatch>`.\n6. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and every sealed dispatch are immutable through Heimr. Sealing writes `HANDOFF.json` and a SHA-256 inventory in `dispatch.json`; `check` verifies that inventory. `dispatch handoff` prints the sealed `HANDOFF.json` only after verifying that dispatch's inventory."
     );
 }

@@ -52,7 +52,12 @@ fn stable_work_and_multiple_dispatches_are_independent() {
         "{\"status\": \"completed\"}\n",
     )
     .unwrap();
-    workspace.check().unwrap();
+    assert!(
+        workspace
+            .check()
+            .unwrap_err()
+            .contains("inventory does not match")
+    );
     assert!(
         workspace
             .put_dispatch_file("build", PathBuf::from("extra").as_path(), b"no")
@@ -164,6 +169,105 @@ fn cli_defaults_to_a_heimr_directory_in_home() {
     assert!(output.status.success(), "{output:?}");
     assert!(home.join(".heimr/demo").is_dir());
     fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn cli_reads_only_verified_sealed_dispatch_handoffs() {
+    let root = temporary_directory();
+    let workspace = Workspace::open(&root, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.new_dispatch("build").unwrap();
+    workspace
+        .put_dispatch_file(
+            "build",
+            PathBuf::from("HANDOFF.json").as_path(),
+            b"{\"status\": \"ready\"}\n",
+        )
+        .unwrap_err();
+    workspace.seal_dispatch("build").unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_heimr");
+    let handoff = Command::new(binary)
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "dispatch",
+            "handoff",
+            "task",
+            "build",
+        ])
+        .output()
+        .unwrap();
+    assert!(handoff.status.success(), "{handoff:?}");
+    assert_eq!(
+        handoff.stdout,
+        b"{\n  \"version\": 1,\n  \"status\": \"pending\"\n}\n"
+    );
+
+    workspace.new_dispatch("unsealed").unwrap();
+    let unsealed = Command::new(binary)
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "dispatch",
+            "handoff",
+            "task",
+            "unsealed",
+        ])
+        .output()
+        .unwrap();
+    assert!(!unsealed.status.success());
+    assert!(
+        String::from_utf8(unsealed.stderr)
+            .unwrap()
+            .contains("dispatch is not sealed: unsealed")
+    );
+
+    let missing = Command::new(binary)
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "dispatch",
+            "handoff",
+            "task",
+            "missing",
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8(missing.stderr)
+            .unwrap()
+            .contains("dispatch does not exist: missing")
+    );
+
+    fs::write(
+        workspace
+            .dispatch_path("build")
+            .unwrap()
+            .join("HANDOFF.json"),
+        b"{\"status\": \"altered\"}\n",
+    )
+    .unwrap();
+    let altered = Command::new(binary)
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "dispatch",
+            "handoff",
+            "task",
+            "build",
+        ])
+        .output()
+        .unwrap();
+    assert!(!altered.status.success());
+    assert!(
+        String::from_utf8(altered.stderr)
+            .unwrap()
+            .contains("inventory does not match")
+    );
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

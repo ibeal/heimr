@@ -155,6 +155,14 @@ impl Workspace {
         Ok(record_path)
     }
 
+    pub fn handoff(&self, dispatch: &str) -> Result<Vec<u8>> {
+        self.require_exists()?;
+        let directory = self.require_sealed_dispatch(dispatch)?;
+        let handoff = fs::read(directory.join("HANDOFF.json")).map_err(io_error)?;
+        verify_dispatch_with_handoff(&directory, &directory.join("dispatch.json"), Some(&handoff))?;
+        Ok(handoff)
+    }
+
     pub fn check(&self) -> Result<()> {
         self.require_exists()?;
         if !self.dispatches_path().is_dir() {
@@ -209,6 +217,17 @@ impl Workspace {
         }
         Ok(path)
     }
+
+    fn require_sealed_dispatch(&self, name: &str) -> Result<PathBuf> {
+        let path = self.dispatch_path(name)?;
+        if !path.is_dir() {
+            return Err(format!("dispatch does not exist: {name}"));
+        }
+        if !path.join("dispatch.json").is_file() {
+            return Err(format!("dispatch is not sealed: {name}"));
+        }
+        Ok(path)
+    }
 }
 
 #[derive(Debug)]
@@ -233,7 +252,7 @@ fn collect_files(base: &Path, directory: &Path, files: &mut Vec<InventoryEntry>)
             collect_files(base, &path, files)?;
         } else if kind.is_file() {
             let relative = path.strip_prefix(base).map_err(|error| error.to_string())?;
-            if relative != Path::new("dispatch.json") && relative != Path::new("HANDOFF.json") {
+            if relative != Path::new("dispatch.json") {
                 files.push(InventoryEntry {
                     path: path_to_slashes(relative)?,
                     digest: sha256_file(&path)?,
@@ -250,8 +269,23 @@ fn collect_files(base: &Path, directory: &Path, files: &mut Vec<InventoryEntry>)
 }
 
 fn verify_dispatch(directory: &Path, record: &Path) -> Result<()> {
+    verify_dispatch_with_handoff(directory, record, None)
+}
+
+fn verify_dispatch_with_handoff(
+    directory: &Path,
+    record: &Path,
+    handoff: Option<&[u8]>,
+) -> Result<()> {
     let actual = fs::read_to_string(record).map_err(io_error)?;
-    let entries = inventory(directory)?;
+    let mut entries = inventory(directory)?;
+    if let Some(handoff) = handoff {
+        let handoff_entry = entries
+            .iter_mut()
+            .find(|entry| entry.path == "HANDOFF.json")
+            .ok_or_else(|| "sealed dispatch is missing HANDOFF.json".to_owned())?;
+        handoff_entry.digest = sha256_bytes(handoff);
+    }
     let expected = format!(
         "{{\n  \"version\": 1,\n  \"files\": [\n{}\n  ]\n}}\n",
         entries
@@ -404,6 +438,12 @@ fn sha256_file(path: &Path) -> Result<String> {
         hash.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    format!("{:x}", hash.finalize())
 }
 
 fn path_to_slashes(path: &Path) -> Result<String> {

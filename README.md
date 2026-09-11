@@ -15,11 +15,12 @@ heimr --root /workspaces repo prepare ask-2026-09-02 --url https://github.com/ex
 heimr --root /workspaces dispatch new ask-2026-09-02 build
 heimr --root /workspaces dispatch put ask-2026-09-02 build --path AGENTS.md --from build-agents.md
 heimr --root /workspaces dispatch seal ask-2026-09-02 build
+heimr --root /workspaces dispatch handoff ask-2026-09-02 build
 ```
 
 `work set` writes the one stable `WORK.md` and refuses replacement. `repo prepare` creates a detached Git worktree in `repository/` from the supplied checkout and is safe to repeat after validation. Repository guidance such as `repository/AGENTS.md` remains there.
 
-`dispatch put` takes file content from `--from` or standard input and only accepts confined relative paths. A dispatch accepts any files before sealing. `dispatch seal` writes its file inventory and SHA-256 digests to `dispatch.json` and adds that dispatch's `HANDOFF.json`; sealed dispatches are immutable through Heimr. `heimr check <workspace>` validates the workspace and every sealed dispatch inventory.
+`dispatch put` takes file content from `--from` or standard input and only accepts confined relative paths. A dispatch accepts any files before sealing. `dispatch seal` writes its file inventory and SHA-256 digests to `dispatch.json` and adds that dispatch's `HANDOFF.json`; sealed dispatches are immutable through Heimr. `dispatch handoff <workspace> <dispatch>` prints a sealed dispatch's verified `HANDOFF.json`, so an orchestrator need not discover the workspace path or read it directly. It rejects unknown or unsealed dispatches. `heimr check <workspace>` validates the workspace and every sealed dispatch inventory.
 
 ```text
 <root>/<workspace>/
