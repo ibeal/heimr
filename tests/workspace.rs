@@ -579,6 +579,118 @@ fn check_detects_a_repository_with_external_git_metadata() {
 }
 
 #[test]
+fn preamble_names_the_fixed_sandbox_context_and_forge_boundary() {
+    for kind in ["build", "review"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_heimr"))
+            .args(["preamble", kind])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let preamble = String::from_utf8(output.stdout).unwrap();
+        assert!(preamble.contains("/workspace/WORK.md"));
+        assert!(preamble.contains("/workspace/dispatches"));
+        assert!(preamble.contains("HANDOFF.json"));
+        assert!(preamble.contains("no Skald or Rata"));
+        assert!(preamble.contains("gh or az"));
+        assert!(preamble.contains("mcp__tools"));
+    }
+    let build = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["preamble", "build"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(build.stdout)
+            .unwrap()
+            .contains("Build the dispatched task")
+    );
+    let review = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["preamble", "review"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(review.stdout)
+            .unwrap()
+            .contains("Review the dispatched task")
+    );
+
+    let bogus = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["preamble", "bogus"])
+        .output()
+        .unwrap();
+    assert!(!bogus.status.success());
+    assert!(
+        String::from_utf8(bogus.stderr)
+            .unwrap()
+            .contains("kind must be build or review")
+    );
+}
+
+#[test]
+fn template_scaffolds_match_the_documented_schema_per_kind() {
+    let build = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["template", "build"])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{build:?}");
+    let build = String::from_utf8(build.stdout).unwrap();
+    for heading in [
+        "## Goal",
+        "## Acceptance criteria",
+        "## Constraints",
+        "## Verification",
+        "## Deliverable",
+    ] {
+        assert!(
+            build.contains(heading),
+            "missing {heading} in build template"
+        );
+    }
+
+    let review = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["template", "review"])
+        .output()
+        .unwrap();
+    assert!(review.status.success(), "{review:?}");
+    let review = String::from_utf8(review.stdout).unwrap();
+    for heading in [
+        "## Frame",
+        "## Acceptance criteria",
+        "## Review checklist",
+        "## Read-only boundary",
+        "## Expected HANDOFF.json shape",
+    ] {
+        assert!(
+            review.contains(heading),
+            "missing {heading} in review template"
+        );
+    }
+
+    let bogus = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["template", "bogus"])
+        .output()
+        .unwrap();
+    assert!(!bogus.status.success());
+    assert!(
+        String::from_utf8(bogus.stderr)
+            .unwrap()
+            .contains("kind must be build or review")
+    );
+}
+
+#[test]
+fn preamble_and_template_do_not_require_a_workspace_root() {
+    for command in [["preamble", "build"], ["template", "review"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_heimr"))
+            .args(command)
+            .env_remove("HEIMR_ROOT")
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+}
+
+#[test]
 fn help_and_docs_do_not_require_a_workspace_root() {
     let help = Command::new(env!("CARGO_BIN_EXE_heimr"))
         .arg("help")
@@ -597,4 +709,6 @@ fn help_and_docs_do_not_require_a_workspace_root() {
     let docs = String::from_utf8(docs.stdout).unwrap();
     assert!(docs.starts_with("# Agent Usage"));
     assert!(docs.contains("heimr check <workspace>"));
+    assert!(docs.contains("heimr preamble build"));
+    assert!(docs.contains("heimr template build"));
 }
