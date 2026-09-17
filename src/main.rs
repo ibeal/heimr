@@ -29,6 +29,16 @@ fn run() -> Result<(), String> {
             print_docs();
             return Ok(());
         }
+        "preamble" => {
+            let kind = kind_arg(&args)?;
+            print!("{}", harness_preamble(kind)?);
+            return Ok(());
+        }
+        "template" => {
+            let kind = kind_arg(&args)?;
+            print!("{}", work_template(kind)?);
+            return Ok(());
+        }
         _ => {}
     }
     let root = root
@@ -171,12 +181,89 @@ fn usage() -> String {
 
 fn print_help() {
     println!(
-        "Heimr manages durable, tool-agnostic agent workspaces.\n\nUsage: heimr [--root <path>] <command> ...\n\nCommands:\n  new <workspace>\n  list\n  path <workspace>\n  show <workspace>\n  check <workspace>\n  work set <workspace> [--from <path>]\n  repo prepare <workspace> (--from <checkout> | --url <git-url>)\n  dispatch new <workspace> <dispatch>\n  dispatch put <workspace> <dispatch> --path <path> [--from <path>]\n  dispatch seal <workspace> <dispatch>\n  dispatch handoff <workspace> <dispatch>\n  docs\n  help\n\nWorkspace commands default to ~/.heimr. Set HEIMR_ROOT or pass --root to override it."
+        "Heimr manages durable, tool-agnostic agent workspaces.\n\nUsage: heimr [--root <path>] <command> ...\n\nCommands:\n  new <workspace>\n  list\n  path <workspace>\n  show <workspace>\n  check <workspace>\n  work set <workspace> [--from <path>]\n  repo prepare <workspace> (--from <checkout> | --url <git-url>)\n  dispatch new <workspace> <dispatch>\n  dispatch put <workspace> <dispatch> --path <path> [--from <path>]\n  dispatch seal <workspace> <dispatch>\n  dispatch handoff <workspace> <dispatch>\n  preamble (build|review)\n  template (build|review)\n  docs\n  help\n\nWorkspace commands default to ~/.heimr. Set HEIMR_ROOT or pass --root to override it.\n\n`preamble` and `template` take no workspace root: they print the standard sandboxed-worker harness preamble and the matching WORK.md scaffold for a build or review dispatch."
     );
 }
 
 fn print_docs() {
     println!(
-        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Create a dispatch, add its inputs, then seal it.\n5. An orchestrator can consume its sealed handoff with `heimr dispatch handoff <workspace> <dispatch>`.\n6. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and every sealed dispatch are immutable through Heimr. Sealing writes `HANDOFF.json` and a SHA-256 inventory in `dispatch.json`; `check` verifies that inventory. `dispatch handoff` prints the sealed `HANDOFF.json` only after verifying that dispatch's inventory."
+        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`, starting from `heimr template build` or `heimr template review`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Create a dispatch, add its inputs, then seal it.\n5. An orchestrator can consume its sealed handoff with `heimr dispatch handoff <workspace> <dispatch>`.\n6. Launch the sandboxed worker with `heimr preamble build` or `heimr preamble review` as the harness invocation preamble (for example, one `gardr run start --harness-arg` value).\n7. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and every sealed dispatch are immutable through Heimr. Sealing writes `HANDOFF.json` and a SHA-256 inventory in `dispatch.json`; `check` verifies that inventory. `dispatch handoff` prints the sealed `HANDOFF.json` only after verifying that dispatch's inventory.\n\n`preamble` and `template` are an interim home for dispatch-ergonomics scaffolding pending a dedicated Styrir interface; they add no new context-delivery mechanism and read no workspace state. Both require a `build` or `review` kind and work without a workspace root. `preamble <kind>` prints the standard sandboxed-worker preamble: it names `/workspace/WORK.md`, the sole sealed dispatch directory under `/workspace/dispatches`, that dispatch's `HANDOFF.json`, and the forge-access rule (no Skald or Rata, direct `gh`/`az`, no `mcp__tools`). `template <kind>` prints a WORK.md scaffold: `build` covers goal, acceptance criteria, constraints, verification, and deliverable; `review` covers frame, acceptance criteria, review checklist, an explicit read-only boundary, and the expected HANDOFF.json shape."
     );
 }
+
+fn kind_arg(args: &[String]) -> Result<&str, String> {
+    match one(args)? {
+        kind @ ("build" | "review") => Ok(kind),
+        _ => Err("kind must be build or review".to_owned()),
+    }
+}
+
+/// The standard harness-invocation preamble for a sealed dispatch. It is
+/// meant to be supplied verbatim as one `gardr run start --harness-arg`
+/// value: it names the fixed sandbox context paths a worker reads
+/// (`/workspace/WORK.md`, the sole sealed dispatch directory, and its
+/// `HANDOFF.json`) and the forge-access boundary (no Skald or Rata, direct
+/// `gh`/`az`, no `mcp__tools`). It carries no workspace- or dispatch-specific
+/// detail, since a Gardr-mounted sandbox always exposes exactly one sealed
+/// dispatch at those fixed paths; all task-specific context still comes from
+/// the dispatch itself, not from this preamble.
+fn harness_preamble(kind: &str) -> Result<String, String> {
+    let action = match kind {
+        "build" => "Build the dispatched task.",
+        "review" => "Review the dispatched task. Do not modify the target repository or worktree.",
+        _ => return Err("kind must be build or review".to_owned()),
+    };
+    Ok(format!(
+        "Read /workspace/WORK.md and the sole sealed dispatch directory under /workspace/dispatches before acting. Your cwd is already the repository. Keep the dispatch HANDOFF.json current. You have no Skald or Rata. Use gh or az directly for forge access if authorized; do not use mcp__tools. {action}\n"
+    ))
+}
+
+/// A WORK.md scaffold matching the schema for `kind`. `build` and `review`
+/// dispatches read different things out of WORK.md, so each gets its own
+/// template; filling one in and passing it to `heimr work set --from <file>`
+/// is the whole workflow this exists to save.
+fn work_template(kind: &str) -> Result<String, String> {
+    match kind {
+        "build" => Ok(BUILD_WORK_TEMPLATE.to_owned()),
+        "review" => Ok(REVIEW_WORK_TEMPLATE.to_owned()),
+        _ => Err("kind must be build or review".to_owned()),
+    }
+}
+
+const BUILD_WORK_TEMPLATE: &str = "\
+# <Task title>\n\n\
+## Goal\n\
+<What must be true when this task is done, and why it matters.>\n\n\
+## Acceptance criteria\n\
+- <Criterion 1>\n\
+- <Criterion 2>\n\n\
+## Constraints\n\
+<Anything the worker must not do, or must do a specific way: scope limits,\n\
+forbidden approaches, required conventions.>\n\n\
+## Verification\n\
+<Exact commands to run and what passing looks like: test suites, lint,\n\
+formatting, manual checks.>\n\n\
+## Deliverable\n\
+<What the worker must leave behind: a pushed branch, a PR, an updated\n\
+HANDOFF.json with per-criterion evidence, and anything else expected.>\n";
+
+const REVIEW_WORK_TEMPLATE: &str = "\
+# <Task title> (review)\n\n\
+## Frame\n\
+<What was built and why, and the revision or diff under review. Do not\n\
+include the builder's prompt, journal, or handoff reasoning; the reviewer\n\
+works from the target revision and this brief alone.>\n\n\
+## Acceptance criteria\n\
+- <Criterion 1>\n\
+- <Criterion 2>\n\n\
+## Review checklist\n\
+- <Design, readability, correctness>\n\
+- <Production safety>\n\
+- <Fit against each acceptance criterion above>\n\n\
+## Read-only boundary\n\
+The reviewer must not modify the target repository or worktree, and must not\n\
+resolve the builder's PR threads or Skald state. Findings only.\n\n\
+## Expected HANDOFF.json shape\n\
+Record an outcome, blocking/should-fix/nit findings with `path:line` evidence,\n\
+and a verdict per acceptance criterion. Approve only when there are no\n\
+blocking or should-fix findings.\n";
