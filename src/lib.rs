@@ -49,24 +49,43 @@ impl Workspace {
         write_new(&self.work_path(), content)
     }
 
+    /// Prepares the workspace repository from an existing local checkout.
+    ///
+    /// The prepared repository is always a fully self-contained clone: it
+    /// never reuses the source checkout's Git administrative directory, so
+    /// the result works identically whether `source` is a branch tip, a
+    /// detached commit, or itself a linked worktree.
     pub fn prepare_repository(&self, source: &Path) -> Result<()> {
         self.require_exists()?;
         if self.repository_path().exists() {
             return validate_worktree(&self.repository_path());
         }
         let source = source.canonicalize().map_err(io_error)?;
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["worktree", "add", "--detach"])
-            .arg(self.repository_path())
-            .arg("HEAD")
-            .output()
-            .map_err(io_error)?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-        }
-        validate_worktree(&self.repository_path())
+        let commit = git_stdout(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["rev-parse", "HEAD"]),
+            "failed to resolve source HEAD",
+        )?;
+        self.install_clone(|clone| {
+            run_git(
+                Command::new("git")
+                    .args(["clone", "--no-hardlinks"])
+                    .arg(&source)
+                    .arg(clone),
+                "git clone failed",
+            )?;
+            run_git(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(clone)
+                    .args(["switch", "--detach"])
+                    .arg(&commit),
+                "git checkout failed",
+            )?;
+            detach_from_clone_origin(clone)
+        })
     }
 
     pub fn prepare_repository_url(&self, url: &str) -> Result<()> {
@@ -74,21 +93,31 @@ impl Workspace {
         if self.repository_path().exists() {
             return validate_worktree(&self.repository_path());
         }
-
-        let staging = self.create_clone_staging_directory()?;
-        let clone = staging.join("repository");
-        let result = (|| {
+        self.install_clone(|clone| {
             run_git(
-                Command::new("git").args(["clone", url]).arg(&clone),
+                Command::new("git").args(["clone", url]).arg(clone),
                 "git clone failed",
             )?;
             run_git(
                 Command::new("git")
                     .arg("-C")
-                    .arg(&clone)
+                    .arg(clone)
                     .args(["switch", "--detach"]),
                 "git checkout failed",
             )?;
+            detach_from_clone_origin(clone)
+        })
+    }
+
+    /// Stages a repository built by `populate` under a temporary directory
+    /// inside the workspace, validates it is a self-contained worktree, and
+    /// atomically installs it as the workspace repository. The staging
+    /// directory is always removed, whether or not `populate` succeeds.
+    fn install_clone(&self, populate: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+        let staging = self.create_clone_staging_directory()?;
+        let clone = staging.join("repository");
+        let result = (|| {
+            populate(&clone)?;
             validate_worktree(&clone)?;
             fs::rename(&clone, self.repository_path()).map_err(io_error)
         })();
@@ -308,20 +337,108 @@ fn verify_dispatch_with_handoff(
     }
 }
 
+/// Confirms `path` is a Git worktree whose administrative directory,
+/// common directory, and object alternates all live under `path` itself.
+/// This is what makes ordinary Git history and diff operations work
+/// without touching any path outside the prepared repository: a linked
+/// worktree (whose `.git` file points at a separate repository's
+/// `.git/worktrees/<name>` directory) or an alternates file referencing
+/// an external object store fails this check.
 fn validate_worktree(path: &Path) -> Result<()> {
+    let canonical = path.canonicalize().map_err(io_error)?;
+
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .map_err(io_error)?;
-    if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true" {
-        Ok(())
-    } else {
-        Err(format!(
+    if !(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true") {
+        return Err(format!(
             "repository is not a valid Git worktree: {}",
             path.display()
-        ))
+        ));
+    }
+
+    let git_dir_raw = git_stdout(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--absolute-git-dir"]),
+        "failed to resolve the repository's Git directory",
+    )?;
+    let git_dir = PathBuf::from(&git_dir_raw)
+        .canonicalize()
+        .map_err(io_error)?;
+    if !git_dir.starts_with(&canonical) {
+        return Err(format!(
+            "repository Git metadata lives outside the prepared repository: {}",
+            git_dir.display()
+        ));
+    }
+
+    let common_dir_raw = git_stdout(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--git-common-dir"]),
+        "failed to resolve the repository's common Git directory",
+    )?;
+    let common_dir = PathBuf::from(&common_dir_raw);
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        path.join(common_dir)
+    };
+    let common_dir = common_dir.canonicalize().map_err(io_error)?;
+    if common_dir != git_dir {
+        return Err(format!(
+            "repository is a linked worktree referencing external Git metadata: {}",
+            common_dir.display()
+        ));
+    }
+
+    let alternates = git_dir.join("objects/info/alternates");
+    if alternates.exists() {
+        let content = fs::read_to_string(&alternates).map_err(io_error)?;
+        for line in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let alternate = PathBuf::from(line);
+            let alternate = if alternate.is_absolute() {
+                alternate
+            } else {
+                git_dir.join("objects").join(alternate)
+            };
+            let alternate = alternate.canonicalize().map_err(io_error)?;
+            if !alternate.starts_with(&canonical) {
+                return Err(format!(
+                    "repository objects depend on an external alternate store: {}",
+                    alternate.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Removes the `origin` remote left behind by a local clone so the prepared
+/// repository does not retain Git configuration pointing at the source
+/// checkout's filesystem path.
+fn detach_from_clone_origin(path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "remove", "origin"])
+        .output()
+        .map_err(io_error)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if detail.contains("No such remote") {
+        Ok(())
+    } else {
+        Err(format!("failed to remove clone origin remote: {detail}"))
     }
 }
 
@@ -329,6 +446,20 @@ fn run_git(command: &mut Command, context: &str) -> Result<()> {
     let output = command.output().map_err(io_error)?;
     if output.status.success() {
         Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if detail.is_empty() {
+            Err(context.to_owned())
+        } else {
+            Err(format!("{context}: {detail}"))
+        }
+    }
+}
+
+fn git_stdout(command: &mut Command, context: &str) -> Result<String> {
+    let output = command.output().map_err(io_error)?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     } else {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         if detail.is_empty() {

@@ -395,6 +395,189 @@ fn run_git<const N: usize>(directory: &std::path::Path, args: [&str; N]) {
     assert!(status.success());
 }
 
+fn git_stdout<const N: usize>(directory: &std::path::Path, args: [&str; N]) -> String {
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// Asserts that `repository` supports ordinary Git history and diff
+/// operations, and that none of its Git administrative state resolves
+/// outside the repository itself (the portability contract this module
+/// exists to guarantee).
+fn assert_self_contained_worktree(repository: &std::path::Path) {
+    run_git(repository, ["log", "--oneline"]);
+    run_git(repository, ["show", "HEAD"]);
+    run_git(repository, ["branch", "-a"]);
+    std::fs::write(repository.join("portability.txt"), "changed\n").unwrap();
+    run_git(repository, ["diff", "--stat"]);
+    std::fs::remove_file(repository.join("portability.txt")).unwrap();
+
+    let git_dir = git_stdout(repository, ["rev-parse", "--absolute-git-dir"]);
+    let git_dir = std::fs::canonicalize(git_dir).unwrap();
+    let repository = std::fs::canonicalize(repository).unwrap();
+    assert!(
+        git_dir.starts_with(&repository),
+        "git-dir {} escapes repository {}",
+        git_dir.display(),
+        repository.display()
+    );
+
+    let common_dir = git_stdout(&repository, ["rev-parse", "--git-common-dir"]);
+    let common_dir = std::fs::canonicalize(repository.join(&common_dir))
+        .or_else(|_| std::fs::canonicalize(&common_dir))
+        .unwrap();
+    assert_eq!(
+        common_dir, git_dir,
+        "repository is a linked worktree, not a self-contained clone"
+    );
+
+    let remotes = git_stdout(&repository, ["remote"]);
+    assert!(
+        remotes.is_empty(),
+        "prepared repository retained remotes: {remotes}"
+    );
+}
+
+#[test]
+fn prepared_repository_from_a_branch_tip_is_self_contained_after_the_source_is_removed() {
+    let temp = temporary_directory();
+    let source = temp.join("source");
+    run_git(&temp, ["init", source.to_str().unwrap()]);
+    run_git(&source, ["config", "user.email", "heimr@example.test"]);
+    run_git(&source, ["config", "user.name", "Heimr Test"]);
+    fs::write(source.join("README.md"), "branch tip\n").unwrap();
+    run_git(&source, ["add", "README.md"]);
+    run_git(&source, ["commit", "-m", "initial"]);
+    run_git(&source, ["checkout", "-b", "feature"]);
+    fs::write(source.join("README.md"), "branch tip, updated\n").unwrap();
+    run_git(&source, ["commit", "-am", "update"]);
+
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.prepare_repository(&source).unwrap();
+
+    let repository = workspace.repository_path();
+    assert_eq!(
+        fs::read_to_string(repository.join("README.md")).unwrap(),
+        "branch tip, updated\n"
+    );
+    // A self-contained clone survives the source checkout disappearing
+    // entirely, which a linked worktree could never do.
+    fs::remove_dir_all(&source).unwrap();
+    assert_self_contained_worktree(&repository);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn prepared_repository_from_a_detached_commit_is_self_contained_after_the_source_is_removed() {
+    let temp = temporary_directory();
+    let source = temp.join("source");
+    run_git(&temp, ["init", source.to_str().unwrap()]);
+    run_git(&source, ["config", "user.email", "heimr@example.test"]);
+    run_git(&source, ["config", "user.name", "Heimr Test"]);
+    fs::write(source.join("README.md"), "first\n").unwrap();
+    run_git(&source, ["add", "README.md"]);
+    run_git(&source, ["commit", "-m", "first"]);
+    let first_commit = git_stdout(&source, ["rev-parse", "HEAD"]);
+    fs::write(source.join("README.md"), "second\n").unwrap();
+    run_git(&source, ["commit", "-am", "second"]);
+    run_git(&source, ["checkout", &first_commit]);
+
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.prepare_repository(&source).unwrap();
+
+    let repository = workspace.repository_path();
+    assert_eq!(
+        fs::read_to_string(repository.join("README.md")).unwrap(),
+        "first\n"
+    );
+    fs::remove_dir_all(&source).unwrap();
+    assert_self_contained_worktree(&repository);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn prepared_repository_from_a_linked_worktree_source_is_self_contained_after_the_source_is_removed()
+{
+    let temp = temporary_directory();
+    let main = temp.join("main");
+    run_git(&temp, ["init", main.to_str().unwrap()]);
+    run_git(&main, ["config", "user.email", "heimr@example.test"]);
+    run_git(&main, ["config", "user.name", "Heimr Test"]);
+    fs::write(main.join("README.md"), "main\n").unwrap();
+    run_git(&main, ["add", "README.md"]);
+    run_git(&main, ["commit", "-m", "initial"]);
+    run_git(&main, ["branch", "linked"]);
+    let linked_source = temp.join("linked-source");
+    run_git(
+        &main,
+        [
+            "worktree",
+            "add",
+            linked_source.to_str().unwrap(),
+            "linked",
+        ],
+    );
+    assert!(linked_source.join(".git").is_file());
+
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.prepare_repository(&linked_source).unwrap();
+
+    let repository = workspace.repository_path();
+    assert_eq!(
+        fs::read_to_string(repository.join("README.md")).unwrap(),
+        "main\n"
+    );
+    // Removing the whole main repository (and with it the linked worktree's
+    // administrative directory under main/.git/worktrees) must not affect
+    // the prepared repository at all.
+    fs::remove_dir_all(&main).unwrap();
+    let _ = fs::remove_dir_all(&linked_source);
+    assert_self_contained_worktree(&repository);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn check_detects_a_repository_with_external_git_metadata() {
+    let temp = temporary_directory();
+    let main = temp.join("main");
+    run_git(&temp, ["init", main.to_str().unwrap()]);
+    run_git(&main, ["config", "user.email", "heimr@example.test"]);
+    run_git(&main, ["config", "user.name", "Heimr Test"]);
+    fs::write(main.join("README.md"), "main\n").unwrap();
+    run_git(&main, ["add", "README.md"]);
+    run_git(&main, ["commit", "-m", "initial"]);
+
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    // Simulate the previous, non-portable behavior directly: a linked
+    // worktree placed at the workspace repository path whose Git
+    // administrative directory lives outside the workspace entirely.
+    run_git(
+        &main,
+        [
+            "worktree",
+            "add",
+            "--detach",
+            workspace.repository_path().to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let error = workspace.check().unwrap_err();
+    assert!(
+        error.contains("linked worktree") || error.contains("outside"),
+        "{error}"
+    );
+    fs::remove_dir_all(temp).unwrap();
+}
+
 #[test]
 fn help_and_docs_do_not_require_a_workspace_root() {
     let help = Command::new(env!("CARGO_BIN_EXE_heimr"))
