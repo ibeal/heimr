@@ -187,9 +187,8 @@ impl Workspace {
     pub fn handoff(&self, dispatch: &str) -> Result<Vec<u8>> {
         self.require_exists()?;
         let directory = self.require_sealed_dispatch(dispatch)?;
-        let handoff = fs::read(directory.join("HANDOFF.json")).map_err(io_error)?;
-        verify_dispatch_with_handoff(&directory, &directory.join("dispatch.json"), Some(&handoff))?;
-        Ok(handoff)
+        verify_dispatch(&directory, &directory.join("dispatch.json"))?;
+        fs::read(directory.join("HANDOFF.json")).map_err(io_error)
     }
 
     pub fn check(&self) -> Result<()> {
@@ -281,7 +280,7 @@ fn collect_files(base: &Path, directory: &Path, files: &mut Vec<InventoryEntry>)
             collect_files(base, &path, files)?;
         } else if kind.is_file() {
             let relative = path.strip_prefix(base).map_err(|error| error.to_string())?;
-            if relative != Path::new("dispatch.json") {
+            if relative != Path::new("dispatch.json") && relative != Path::new("HANDOFF.json") {
                 files.push(InventoryEntry {
                     path: path_to_slashes(relative)?,
                     digest: sha256_file(&path)?,
@@ -298,23 +297,18 @@ fn collect_files(base: &Path, directory: &Path, files: &mut Vec<InventoryEntry>)
 }
 
 fn verify_dispatch(directory: &Path, record: &Path) -> Result<()> {
-    verify_dispatch_with_handoff(directory, record, None)
-}
-
-fn verify_dispatch_with_handoff(
-    directory: &Path,
-    record: &Path,
-    handoff: Option<&[u8]>,
-) -> Result<()> {
-    let actual = fs::read_to_string(record).map_err(io_error)?;
-    let mut entries = inventory(directory)?;
-    if let Some(handoff) = handoff {
-        let handoff_entry = entries
-            .iter_mut()
-            .find(|entry| entry.path == "HANDOFF.json")
-            .ok_or_else(|| "sealed dispatch is missing HANDOFF.json".to_owned())?;
-        handoff_entry.digest = sha256_bytes(handoff);
+    let handoff = directory.join("HANDOFF.json");
+    match fs::symlink_metadata(&handoff) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err("HANDOFF.json must be a regular file".to_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err("sealed dispatch is missing HANDOFF.json".to_owned());
+        }
+        Err(error) => return Err(io_error(error)),
     }
+
+    let actual = fs::read_to_string(record).map_err(io_error)?;
+    let entries = inventory(directory)?;
     let expected = format!(
         "{{\n  \"version\": 1,\n  \"files\": [\n{}\n  ]\n}}\n",
         entries
@@ -327,7 +321,7 @@ fn verify_dispatch_with_handoff(
             .collect::<Vec<_>>()
             .join(",\n")
     );
-    if actual == expected {
+    if actual == expected || legacy_inventory_matches_without_handoff(&actual, &expected) {
         Ok(())
     } else {
         Err(format!(
@@ -335,6 +329,44 @@ fn verify_dispatch_with_handoff(
             directory.display()
         ))
     }
+}
+
+/// Accept inventories written before `HANDOFF.json` became mutable. The old
+/// handoff digest is intentionally discarded; every remaining entry must
+/// still exactly match the current immutable inventory.
+fn legacy_inventory_matches_without_handoff(actual: &str, expected: &str) -> bool {
+    const HEADER: &str = "{\n  \"version\": 1,\n  \"files\": [\n";
+    const FOOTER: &str = "\n  ]\n}\n";
+    const HANDOFF_PREFIX: &str = "    {\"path\": \"HANDOFF.json\", \"sha256\": \"";
+
+    let Some(actual_files) = actual
+        .strip_prefix(HEADER)
+        .and_then(|value| value.strip_suffix(FOOTER))
+    else {
+        return false;
+    };
+    let Some(expected_files) = expected
+        .strip_prefix(HEADER)
+        .and_then(|value| value.strip_suffix(FOOTER))
+    else {
+        return false;
+    };
+
+    let mut found_handoff = false;
+    let immutable_files = actual_files
+        .lines()
+        .filter(|line| {
+            if line.starts_with(HANDOFF_PREFIX) {
+                found_handoff = true;
+                false
+            } else {
+                true
+            }
+        })
+        .map(|line| line.strip_suffix(',').unwrap_or(line))
+        .collect::<Vec<_>>();
+
+    found_handoff && immutable_files.join(",\n") == expected_files
 }
 
 /// Confirms `path` is a Git worktree whose administrative directory,
@@ -401,7 +433,11 @@ fn validate_worktree(path: &Path) -> Result<()> {
     let alternates = git_dir.join("objects/info/alternates");
     if alternates.exists() {
         let content = fs::read_to_string(&alternates).map_err(io_error)?;
-        for line in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for line in content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             let alternate = PathBuf::from(line);
             let alternate = if alternate.is_absolute() {
                 alternate
@@ -569,12 +605,6 @@ fn sha256_file(path: &Path) -> Result<String> {
         hash.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(bytes);
-    format!("{:x}", hash.finalize())
 }
 
 fn path_to_slashes(path: &Path) -> Result<String> {

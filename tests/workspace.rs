@@ -52,11 +52,16 @@ fn stable_work_and_multiple_dispatches_are_independent() {
         "{\"status\": \"completed\"}\n",
     )
     .unwrap();
-    assert!(
-        workspace
-            .check()
-            .unwrap_err()
-            .contains("inventory does not match")
+    workspace.check().unwrap();
+    assert_eq!(
+        fs::read_to_string(
+            workspace
+                .dispatch_path("build")
+                .unwrap()
+                .join("HANDOFF.json")
+        )
+        .unwrap(),
+        "{\"status\": \"completed\"}\n"
     );
     assert!(
         workspace
@@ -185,6 +190,20 @@ fn cli_reads_only_verified_sealed_dispatch_handoffs() {
         )
         .unwrap_err();
     workspace.seal_dispatch("build").unwrap();
+    let record_path = workspace
+        .dispatch_path("build")
+        .unwrap()
+        .join("dispatch.json");
+    let record = fs::read_to_string(&record_path).unwrap();
+    fs::write(
+        record_path,
+        record.replacen(
+            "  \"files\": [\n",
+            "  \"files\": [\n    {\"path\": \"HANDOFF.json\", \"sha256\": \"0d574f6126865166523eca67e8d7003c8b0d4610bcb45778853703e1c1297a6c\"}\n",
+            1,
+        ),
+    )
+    .unwrap();
 
     let binary = env!("CARGO_BIN_EXE_heimr");
     let handoff = Command::new(binary)
@@ -260,12 +279,8 @@ fn cli_reads_only_verified_sealed_dispatch_handoffs() {
         ])
         .output()
         .unwrap();
-    assert!(!altered.status.success());
-    assert!(
-        String::from_utf8(altered.stderr)
-            .unwrap()
-            .contains("inventory does not match")
-    );
+    assert!(altered.status.success(), "{altered:?}");
+    assert_eq!(altered.stdout, b"{\"status\": \"altered\"}\n");
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -517,12 +532,7 @@ fn prepared_repository_from_a_linked_worktree_source_is_self_contained_after_the
     let linked_source = temp.join("linked-source");
     run_git(
         &main,
-        [
-            "worktree",
-            "add",
-            linked_source.to_str().unwrap(),
-            "linked",
-        ],
+        ["worktree", "add", linked_source.to_str().unwrap(), "linked"],
     );
     assert!(linked_source.join(".git").is_file());
 
