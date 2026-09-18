@@ -83,23 +83,35 @@ fn run() -> Result<(), String> {
             reject_extra(&args)?;
             Workspace::open(&root, &name)?.set_work(&read_input(from.as_deref())?)?;
         }
-        "repo" => {
-            require_word(&mut args, "prepare")?;
-            let name = take(&mut args)?;
-            let from = option(&mut args, "--from");
-            let url = option(&mut args, "--url");
-            reject_extra(&args)?;
-            let workspace = Workspace::open(&root, &name)?;
-            match (from, url) {
-                (Some(from), None) => workspace.prepare_repository(Path::new(&from))?,
-                (None, Some(url)) => workspace.prepare_repository_url(&url)?,
-                _ => return Err("exactly one of --from or --url is required".to_owned()),
-            }
-        }
+        "repo" => repo(&root, args)?,
         "dispatch" => dispatch(&root, args)?,
         _ => return Err(usage()),
     }
     Ok(())
+}
+
+fn repo(root: &Path, mut args: Vec<String>) -> Result<(), String> {
+    let action = take(&mut args)?;
+    let name = take(&mut args)?;
+    let workspace = Workspace::open(root, &name)?;
+    match action.as_str() {
+        "prepare" => {
+            let from = option(&mut args, "--from");
+            let url = option(&mut args, "--url");
+            reject_extra(&args)?;
+            match (from, url) {
+                (Some(from), None) => workspace.prepare_repository(Path::new(&from)),
+                (None, Some(url)) => workspace.prepare_repository_url(&url),
+                _ => Err("exactly one of --from or --url is required".to_owned()),
+            }
+        }
+        "set-push-remote" => {
+            let url = option(&mut args, "--url").ok_or_else(|| "--url is required".to_owned())?;
+            reject_extra(&args)?;
+            workspace.set_push_remote(&url)
+        }
+        _ => Err(usage()),
+    }
 }
 
 fn dispatch(root: &Path, mut args: Vec<String>) -> Result<(), String> {
@@ -181,13 +193,13 @@ fn usage() -> String {
 
 fn print_help() {
     println!(
-        "Heimr manages durable, tool-agnostic agent workspaces.\n\nUsage: heimr [--root <path>] <command> ...\n\nCommands:\n  new <workspace>\n  list\n  path <workspace>\n  show <workspace>\n  check <workspace>\n  work set <workspace> [--from <path>]\n  repo prepare <workspace> (--from <checkout> | --url <git-url>)\n  dispatch new <workspace> <dispatch>\n  dispatch put <workspace> <dispatch> --path <path> [--from <path>]\n  dispatch seal <workspace> <dispatch>\n  dispatch handoff <workspace> <dispatch>\n  preamble (build|review)\n  template (build|review)\n  docs\n  help\n\nWorkspace commands default to ~/.heimr. Set HEIMR_ROOT or pass --root to override it.\n\n`preamble` and `template` take no workspace root: they print the standard sandboxed-worker harness preamble and the matching WORK.md scaffold for a build or review dispatch."
+        "Heimr manages durable, tool-agnostic agent workspaces.\n\nUsage: heimr [--root <path>] <command> ...\n\nCommands:\n  new <workspace>\n  list\n  path <workspace>\n  show <workspace>\n  check <workspace>\n  work set <workspace> [--from <path>]\n  repo prepare <workspace> (--from <checkout> | --url <git-url>)\n  repo set-push-remote <workspace> --url <url>\n  dispatch new <workspace> <dispatch>\n  dispatch put <workspace> <dispatch> --path <path> [--from <path>]\n  dispatch seal <workspace> <dispatch>\n  dispatch handoff <workspace> <dispatch>\n  preamble (build|review)\n  template (build|review)\n  docs\n  help\n\nWorkspace commands default to ~/.heimr. Set HEIMR_ROOT or pass --root to override it.\n\n`preamble` and `template` take no workspace root: they print the standard sandboxed-worker harness preamble and the matching WORK.md scaffold for a build or review dispatch."
     );
 }
 
 fn print_docs() {
     println!(
-        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`, starting from `heimr template build` or `heimr template review`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Create a dispatch, add its inputs, then seal it.\n5. An orchestrator can consume its sealed handoff with `heimr dispatch handoff <workspace> <dispatch>`.\n6. Launch the sandboxed worker with `heimr preamble build` or `heimr preamble review` as the harness invocation preamble (for example, one `gardr run start --harness-arg` value).\n7. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and sealed dispatch inputs are immutable through Heimr. Sealing writes a mutable `HANDOFF.json` and a SHA-256 inventory of the immutable inputs in `dispatch.json`; `check` verifies that inventory. `dispatch handoff` verifies the inputs before printing the current `HANDOFF.json`.\n\n`preamble` and `template` are an interim home for dispatch-ergonomics scaffolding pending a dedicated Styrir interface; they add no new context-delivery mechanism and read no workspace state. Both require a `build` or `review` kind and work without a workspace root. `preamble <kind>` prints the standard sandboxed-worker preamble: it names `/workspace/WORK.md`, the sole sealed dispatch directory under `/workspace/dispatches`, that dispatch's `HANDOFF.json`, and the forge-access rule (no Skald or Rata, direct `gh`/`az`, no `mcp__tools`). `template <kind>` prints a WORK.md scaffold: `build` covers goal, acceptance criteria, constraints, verification, and deliverable; `review` covers frame, acceptance criteria, review checklist, an explicit read-only boundary, and the expected HANDOFF.json shape."
+        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`, starting from `heimr template build` or `heimr template review`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Once a worker or orchestrator needs to push the prepared repository somewhere, attach an `origin` push remote with `heimr repo set-push-remote <workspace> --url <url>`. `repo prepare` always strips any clone-origin remote to keep the worktree self-contained, so this is the supported way to (re)attach one; it treats the URL as an opaque string (any forge, any scheme) and is safe to run again with a different URL, which just updates `origin` in place.\n5. Create a dispatch, add its inputs, then seal it.\n6. An orchestrator can consume its sealed handoff with `heimr dispatch handoff <workspace> <dispatch>`.\n7. Launch the sandboxed worker with `heimr preamble build` or `heimr preamble review` as the harness invocation preamble (for example, one `gardr run start --harness-arg` value).\n8. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and sealed dispatch inputs are immutable through Heimr. Sealing writes a mutable `HANDOFF.json` and a SHA-256 inventory of the immutable inputs in `dispatch.json`; `check` verifies that inventory. `dispatch handoff` verifies the inputs before printing the current `HANDOFF.json`.\n\n`preamble` and `template` are an interim home for dispatch-ergonomics scaffolding pending a dedicated Styrir interface; they add no new context-delivery mechanism and read no workspace state. Both require a `build` or `review` kind and work without a workspace root. `preamble <kind>` prints the standard sandboxed-worker preamble: it names `/workspace/WORK.md`, the sole sealed dispatch directory under `/workspace/dispatches`, that dispatch's `HANDOFF.json`, and the forge-access rule (no Skald or Rata, direct `gh`/`az`, no `mcp__tools`). `template <kind>` prints a WORK.md scaffold: `build` covers goal, acceptance criteria, constraints, verification, and deliverable; `review` covers frame, acceptance criteria, review checklist, an explicit read-only boundary, and the expected HANDOFF.json shape."
     );
 }
 

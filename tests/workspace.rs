@@ -401,6 +401,199 @@ fn cli_prepares_a_detached_repository_from_a_url() {
     fs::remove_dir_all(temp).unwrap();
 }
 
+#[test]
+fn set_push_remote_attaches_origin_after_preparing_from_a_local_checkout() {
+    let temp = temporary_directory();
+    let source = temp.join("source");
+    run_git(&temp, ["init", source.to_str().unwrap()]);
+    run_git(&source, ["config", "user.email", "heimr@example.test"]);
+    run_git(&source, ["config", "user.name", "Heimr Test"]);
+    fs::write(source.join("README.md"), "source\n").unwrap();
+    run_git(&source, ["add", "README.md"]);
+    run_git(&source, ["commit", "-m", "initial"]);
+
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.prepare_repository(&source).unwrap();
+
+    let repository = workspace.repository_path();
+    assert!(git_stdout(&repository, ["remote"]).is_empty());
+
+    workspace
+        .set_push_remote("https://example.test/team/project.git")
+        .unwrap();
+    assert_eq!(
+        git_stdout(&repository, ["remote", "get-url", "origin"]),
+        "https://example.test/team/project.git"
+    );
+
+    // Setting it again with a different URL updates the existing remote
+    // instead of failing because origin already exists, and works
+    // identically for a different-shaped forge URL (no scheme special-casing).
+    workspace
+        .set_push_remote("https://dev.azure.com/org/project/_git/repo")
+        .unwrap();
+    assert_eq!(
+        git_stdout(&repository, ["remote", "get-url", "origin"]),
+        "https://dev.azure.com/org/project/_git/repo"
+    );
+    assert_eq!(git_stdout(&repository, ["remote"]), "origin");
+
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn set_push_remote_attaches_origin_after_preparing_from_a_url() {
+    let temp = temporary_directory();
+    let source = temp.join("source");
+    let remote = temp.join("remote.git");
+    run_git(&temp, ["init", source.to_str().unwrap()]);
+    run_git(&source, ["config", "user.email", "heimr@example.test"]);
+    run_git(&source, ["config", "user.name", "Heimr Test"]);
+    fs::write(source.join("README.md"), "source\n").unwrap();
+    run_git(&source, ["add", "README.md"]);
+    run_git(&source, ["commit", "-m", "initial"]);
+    run_git(
+        &temp,
+        [
+            "clone",
+            "--bare",
+            source.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace
+        .prepare_repository_url(remote.to_str().unwrap())
+        .unwrap();
+
+    let repository = workspace.repository_path();
+    assert!(git_stdout(&repository, ["remote"]).is_empty());
+
+    workspace
+        .set_push_remote("https://github.com/example/repo.git")
+        .unwrap();
+    assert_eq!(
+        git_stdout(&repository, ["remote", "get-url", "origin"]),
+        "https://github.com/example/repo.git"
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn set_push_remote_fails_clearly_when_the_repository_has_not_been_prepared() {
+    let temp = temporary_directory();
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+
+    let error = workspace
+        .set_push_remote("https://example.test/team/project.git")
+        .unwrap_err();
+    assert!(error.contains("repository does not exist"), "{error}");
+    assert!(!workspace.repository_path().exists());
+
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn cli_sets_and_updates_the_push_remote() {
+    let temp = temporary_directory();
+    let source = temp.join("source");
+    run_git(&temp, ["init", source.to_str().unwrap()]);
+    run_git(&source, ["config", "user.email", "heimr@example.test"]);
+    run_git(&source, ["config", "user.name", "Heimr Test"]);
+    fs::write(source.join("README.md"), "source\n").unwrap();
+    run_git(&source, ["add", "README.md"]);
+    run_git(&source, ["commit", "-m", "initial"]);
+
+    let binary = env!("CARGO_BIN_EXE_heimr");
+    assert!(
+        Command::new(binary)
+            .args(["--root", temp.to_str().unwrap(), "new", "task"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let not_prepared = Command::new(binary)
+        .args([
+            "--root",
+            temp.to_str().unwrap(),
+            "repo",
+            "set-push-remote",
+            "task",
+            "--url",
+            "https://example.test/team/project.git",
+        ])
+        .output()
+        .unwrap();
+    assert!(!not_prepared.status.success());
+    assert!(
+        String::from_utf8(not_prepared.stderr)
+            .unwrap()
+            .contains("repository does not exist")
+    );
+
+    assert!(
+        Command::new(binary)
+            .args([
+                "--root",
+                temp.to_str().unwrap(),
+                "repo",
+                "prepare",
+                "task",
+                "--from",
+                source.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let set = Command::new(binary)
+        .args([
+            "--root",
+            temp.to_str().unwrap(),
+            "repo",
+            "set-push-remote",
+            "task",
+            "--url",
+            "https://example.test/team/project.git",
+        ])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{set:?}");
+
+    let repository = temp.join("task/repository");
+    assert_eq!(
+        git_stdout(&repository, ["remote", "get-url", "origin"]),
+        "https://example.test/team/project.git"
+    );
+
+    let update = Command::new(binary)
+        .args([
+            "--root",
+            temp.to_str().unwrap(),
+            "repo",
+            "set-push-remote",
+            "task",
+            "--url",
+            "https://dev.azure.com/org/project/_git/repo",
+        ])
+        .output()
+        .unwrap();
+    assert!(update.status.success(), "{update:?}");
+    assert_eq!(
+        git_stdout(&repository, ["remote", "get-url", "origin"]),
+        "https://dev.azure.com/org/project/_git/repo"
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+}
+
 fn run_git<const N: usize>(directory: &std::path::Path, args: [&str; N]) {
     let status = Command::new("git")
         .current_dir(directory)
