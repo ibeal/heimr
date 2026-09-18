@@ -109,6 +109,25 @@ impl Workspace {
         })
     }
 
+    /// Sets (or updates) the workspace repository's `origin` push remote to
+    /// an opaque URL supplied by the caller. Heimr never constructs,
+    /// guesses, or interprets this URL: `prepare_repository`/
+    /// `prepare_repository_url` strip any clone-origin remote so the
+    /// prepared worktree is self-contained, and this is the only supported
+    /// way to (re)attach a remote for a later push. Calling it again with a
+    /// different URL updates the existing remote rather than failing.
+    pub fn set_push_remote(&self, url: &str) -> Result<()> {
+        self.require_exists()?;
+        let repository = self.repository_path();
+        if !repository.is_dir() {
+            return Err(format!(
+                "workspace repository does not exist: {} (run `repo prepare` first)",
+                repository.display()
+            ));
+        }
+        set_remote(&repository, "origin", url)
+    }
+
     /// Stages a repository built by `populate` under a temporary directory
     /// inside the workspace, validates it is a self-contained worktree, and
     /// atomically installs it as the workspace repository. The staging
@@ -475,6 +494,34 @@ fn detach_from_clone_origin(path: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(format!("failed to remove clone origin remote: {detail}"))
+    }
+}
+
+/// Sets `name` to `url` on the repository at `path`, adding the remote if
+/// it does not yet exist or updating its URL in place if it does. The URL
+/// is treated opaquely: no scheme or forge inspection.
+fn set_remote(path: &Path, name: &str, url: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "add", name, url])
+        .output()
+        .map_err(io_error)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if detail.contains("already exists") {
+        run_git(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["remote", "set-url", name])
+                .arg(url),
+            "failed to update push remote",
+        )
+    } else {
+        Err(format!("failed to set push remote: {detail}"))
     }
 }
 
