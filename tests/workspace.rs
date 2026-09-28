@@ -872,6 +872,7 @@ fn template_scaffolds_match_the_documented_schema_per_kind() {
         "## Frame",
         "## Acceptance criteria",
         "## Review checklist",
+        "## Review pass",
         "## PR review",
         "## Deliverable",
     ] {
@@ -965,7 +966,12 @@ fn review_template_states_the_pr_review_contract_and_omits_inbox() {
         .unwrap();
     let review = String::from_utf8(review.stdout).unwrap();
     assert!(review.contains("one `COMMENT` review"));
-    assert!(review.contains("one inline thread per finding"));
+    assert!(review.contains("one inline thread per new finding"));
+    assert!(review.contains("reply on its original"));
+    assert!(review.contains("**first pass**"));
+    assert!(review.contains("**follow-up pass**"));
+    assert!(review.contains("interdiff"));
+    assert!(review.contains("missed in first pass"));
     assert!(review.contains("**<severity>**"));
     assert!(review.contains("Never approve or request changes on the forge"));
     assert!(review.contains("read-only"));

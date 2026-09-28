@@ -201,7 +201,7 @@ fn print_docs() {
     println!(
         "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its work brief with `heimr work set <workspace> --from <file>`, starting from `heimr template build` or `heimr template review`. `work set` replaces any existing `WORK.md`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Once a worker or orchestrator needs to push the prepared repository somewhere, attach an `origin` push remote with `heimr repo set-push-remote <workspace> --url <url>`. `repo prepare` always strips any clone-origin remote to keep the worktree self-contained, so this is the supported way to (re)attach one; it treats the URL as an opaque string (any forge, any scheme) and is safe to run again with a different URL, which just updates `origin` in place.\n5. Create a dispatch, add its inputs, then seal it.\n6. An orchestrator can consume its sealed handoff with `heimr dispatch handoff <workspace> <dispatch>`.\n7. Launch the sandboxed worker with `heimr preamble build` or `heimr preamble review` as the harness invocation preamble (for example, one `gardr run start --harness-arg` value).\n8. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `work set` replaces `WORK.md` whether or not one already exists; sealed dispatch inputs remain immutable through Heimr. Sealing writes a mutable `HANDOFF.json` and a SHA-256 inventory of the immutable inputs in `dispatch.json`; `check` verifies that inventory. `dispatch handoff` verifies the inputs before printing the current `HANDOFF.json`.\n\nHeimr owns the dispatch contract: what each agent role is told (`preamble`, `template`), and how one agent's handoff reaches the next (inbox files and PR threads, below). `preamble` and `template` add no new context-delivery mechanism and read no workspace state; they are text generation only. Both require a `build` or `review` kind and work without a workspace root. `preamble <kind>` prints the standard sandboxed-worker preamble: it names `/workspace/WORK.md`, the sole sealed dispatch directory under `/workspace/dispatches`, that dispatch's `HANDOFF.json`, and the forge-access rule (no Skald or Rata, direct `gh`/`az`, no `mcp__tools`). `preamble review` does not claim the reviewer is read-only on the forge: a reviewer posts PR review comments, it just must not modify the target repository or worktree.
 
-`template <kind>` prints a WORK.md scaffold with `{{{{token}}}}` placeholders that the caller (styrir) substitutes literally; unknown tokens are left as-is and no other templating happens. `template build` tokens: `title`, `ticket_id`, `tracker`, `acceptance_criteria`, `branch`, `trunk`, `verify`, `pr_command`, `pr` (empty on the first build of a ticket). `template review` tokens: `title`, `ticket_id`, `acceptance_criteria`, `branch`, `trunk`, `pr`. `build` covers goal, acceptance criteria, constraints, verification, deliverable, escalation, inbox, and PR threads. `review` covers frame (with an explicit read-only boundary on the worktree and ticket), review checklist, PR review instructions, and the expected HANDOFF.json shape.
+`template <kind>` prints a WORK.md scaffold with `{{{{token}}}}` placeholders that the caller (styrir) substitutes literally; unknown tokens are left as-is and no other templating happens. `template build` tokens: `title`, `ticket_id`, `tracker`, `acceptance_criteria`, `branch`, `trunk`, `verify`, `pr_command`, `pr` (empty on the first build of a ticket). `template review` tokens: `title`, `ticket_id`, `acceptance_criteria`, `branch`, `trunk`, `pr`. `build` covers goal, acceptance criteria, constraints, verification, deliverable, escalation, inbox, and PR threads. `review` covers frame (with an explicit read-only boundary on the worktree and ticket), review checklist, review pass (a thorough first pass vs. a follow-up pass that verifies earlier findings against the interdiff, detected from earlier reviews on the PR), PR review instructions, and the expected HANDOFF.json shape.
 
 ## Inbox convention
 
@@ -212,8 +212,10 @@ inbox, and the review template never mentions one.
 
 ## PR threads
 
-A reviewer posts exactly one `COMMENT` review on the PR with one inline thread per finding, each
+A reviewer posts exactly one `COMMENT` review on the PR with one inline thread per new finding, each
 thread body prefixed `**<severity>**`; it never approves or requests changes on the forge itself.
+On a follow-up pass it replies on the original thread of any earlier finding that is still
+unaddressed, rather than opening a duplicate.
 A builder reads every unresolved thread on its PR before acting, replies pointing at the commit
 that addresses it or declines it in one line, then resolves the thread. A human thread with no
 severity tag is treated as should-fix. The PR wins over the inbox when the two conflict.
@@ -317,10 +319,38 @@ read-only: do not modify the target repository or worktree, and do not change ti
 - Severity: blocking / should-fix / nit, each tied to `path:line`. Documentation findings are nits\n\
   unless grossly misleading. A nit is genuinely optional.\n\
 - Verdict follows severity mechanically: approve only when there is nothing above nit.\n\n\
+## Review pass\n\
+Start by reading every earlier review on {{pr}}, with its threads and the replies to them. Resolved\n\
+threads count too. If there is no earlier review, this is a **first pass**; otherwise it is a\n\
+**follow-up pass**. The last-reviewed revision is the commit the latest earlier review was made on.\n\n\
+**First pass: be thorough.** Review the whole diff against `{{trunk}}` and report every finding at\n\
+every severity now. Aim for zero new findings on this code in later rounds. Before you post, check\n\
+the findings as a set: no two findings may conflict, and no finding may ask for something the\n\
+acceptance criteria rule out.\n\n\
+**Follow-up pass: verify, don't re-review.** Work from the interdiff\n\
+(`git diff <last-reviewed>..HEAD`). If that commit is not in the worktree, use\n\
+`git range-diff`, and say so in the summary. Do these three things only:\n\
+1. Resolve each earlier finding as addressed, not addressed, or pushed back. Accept a pushback\n\
+   unless it is factually wrong or leaves a correctness or safety bug.\n\
+2. Check the fix hunks for regressions. Do not ask whether you would have written them another way.\n\
+3. Treat settled code as closed. Do not reverse or re-argue an earlier finding, and do not raise\n\
+   new findings on code that the first pass reviewed and that hasn't changed. If a requested fix was\n\
+   made as asked, leave it, even if you now prefer something else. It is a nit at most, and only a\n\
+   real bug justifies asking to revert it.\n\n\
+Follow-up exceptions:\n\
+- A *blocking* correctness or security bug that the first pass missed is still raised. Start its\n\
+  description with `missed in first pass`.\n\
+- A substantial change that no earlier finding asked for gets a first-pass review, limited to that\n\
+  code. Examples are new files, new behavior, or a rewrite larger than the finding requested. A\n\
+  hunk that maps to no earlier finding is the signal.\n\n\
+A follow-up pass approves when every earlier finding is addressed or its pushback is accepted, and\n\
+the delta adds nothing above nit.\n\n\
 ## PR review\n\
-Post exactly one `COMMENT` review on {{pr}} with one inline thread per finding, each thread body\n\
-starting `**<severity>**`. Never approve or request changes on the forge itself — the verdict\n\
-belongs in HANDOFF.json. Record each finding's `thread_url` in HANDOFF.json.\n\n\
+Post exactly one `COMMENT` review on {{pr}} with one inline thread per new finding, each thread body\n\
+starting `**<severity>**`. If an earlier finding is still not addressed, reply on its original\n\
+thread. Do not open a duplicate. Report it in HANDOFF.json with that thread's URL.\n\
+Never approve or request changes on the forge itself — the verdict belongs in HANDOFF.json.\n\
+Record each finding's `thread_url` in HANDOFF.json.\n\n\
 ## Deliverable\n\
 HANDOFF.json kept current, shape:\n\
 `{\"version\":1,\"status\":\"complete\",\"verdict\":\"approve\"|\"request-changes\",\"summary\":\"…\",\"acceptance_criteria\":[{\"criterion\":\"…\",\"status\":\"done\"|\"partial\"|\"missing\",\"evidence\":\"…\"}],\"findings\":[{\"severity\":\"blocking\"|\"should-fix\"|\"nit\",\"description\":\"…\",\"path\":\"…\",\"line\":0,\"thread_url\":\"…\"}]}`\n";

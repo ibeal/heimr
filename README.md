@@ -68,16 +68,18 @@ as-is; there is no other templating.
   `verify`, `pr_command`, `pr` (empty on the first build). Covers goal, acceptance criteria,
   constraints, verification, deliverable, escalation, inbox, and PR threads.
 - `review` tokens: `title`, `ticket_id`, `acceptance_criteria`, `branch`, `trunk`, `pr`. Covers
-  frame (with an explicit read-only boundary on the worktree and ticket), review checklist, PR
-  review instructions, and the expected `HANDOFF.json` shape.
+  frame (with an explicit read-only boundary on the worktree and ticket), review checklist, review
+  pass (a thorough first pass, or a follow-up pass that verifies earlier findings against the
+  interdiff; detected from earlier reviews on the PR), PR review instructions, and the expected `HANDOFF.json` shape.
 
 **Inbox.** A build dispatch may carry `inbox/*.handoff.json` (a prior dispatch's `HANDOFF.json`,
 byte-for-byte) and `inbox/*.md` (human notes); the build template tells the agent every file under
 `inbox/` is work addressed to it. Review dispatches never carry an inbox, and the review template
 never mentions one.
 
-**PR threads.** A reviewer posts exactly one `COMMENT` review with one inline thread per finding,
-each body prefixed `**<severity>**`, and never approves or requests changes on the forge itself. A
+**PR threads.** A reviewer posts exactly one `COMMENT` review with one inline thread per new finding,
+each body prefixed `**<severity>**`, and never approves or requests changes on the forge itself. On
+a follow-up pass it replies on the original thread of a still-unaddressed finding instead. A
 builder reads every unresolved thread on its PR before acting, replies pointing at a commit or
 declines in one line, then resolves it. The PR wins over the inbox on conflict.
 
