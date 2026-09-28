@@ -686,24 +686,12 @@ fn write_new(path: &Path, content: &[u8]) -> Result<()> {
     if path.exists() {
         return Err(format!("refusing to overwrite {}", path.display()));
     }
-    let temporary = temporary_sibling(path);
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(io_error)?;
-        file.write_all(content).map_err(io_error)?;
-        file.sync_all().map_err(io_error)?;
+    write_atomic(path, content, || {
         if path.exists() {
             return Err(format!("refusing to overwrite {}", path.display()));
         }
-        fs::rename(&temporary, path).map_err(io_error)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
+        Ok(())
+    })
 }
 
 /// Writes `content` to `path`, replacing any existing file. A synced
@@ -712,6 +700,20 @@ fn write_new(path: &Path, content: &[u8]) -> Result<()> {
 /// full new contents, never a partial file. On failure the temporary file
 /// is removed and any existing `path` is left untouched.
 fn write_replacing(path: &Path, content: &[u8]) -> Result<()> {
+    write_atomic(path, content, || Ok(()))
+}
+
+/// Shared body for atomic writes: writes `content` to a synced temporary
+/// file next to `path`, then renames it over `path`. `precondition` runs
+/// after the temporary file is synced but before the rename, so callers
+/// can enforce an overwrite policy (or allow none) at the last possible
+/// moment; on any failure the temporary file is removed and `path` is
+/// left untouched.
+fn write_atomic(
+    path: &Path,
+    content: &[u8],
+    precondition: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let temporary = temporary_sibling(path);
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -721,6 +723,7 @@ fn write_replacing(path: &Path, content: &[u8]) -> Result<()> {
             .map_err(io_error)?;
         file.write_all(content).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
+        precondition()?;
         fs::rename(&temporary, path).map_err(io_error)
     })();
     if result.is_err() {
