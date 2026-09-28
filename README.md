@@ -35,12 +35,13 @@ heimr --root /workspaces dispatch handoff ask-2026-09-02 build
 
 Gardr can mount the workspace broadly, mount `repository/` beneath the execution root, and overlay the selected dispatch's `AGENTS.md` at that root. This preserves repository-local guidance while each dispatch supplies its own top-level instructions and handoff.
 
-## Dispatch ergonomics: preamble and template
+## Dispatch contract: preamble, template, inbox, PR threads
 
-`heimr preamble (build|review)` and `heimr template (build|review)` remove per-ticket
-orchestration boilerplate. Neither needs a workspace root; both read no workspace state, so they
-add no new context-delivery mechanism, they only save typing the same fixed text every dispatch.
-This is an interim Heimr home for the two; a future Styrir interface is expected to own it.
+Heimr owns the dispatch contract: what each agent role is told, and how one agent's handoff
+reaches the next. `heimr preamble (build|review)` and `heimr template (build|review)` remove
+per-ticket orchestration boilerplate. Neither needs a workspace root; both read no workspace
+state, so they add no new context-delivery mechanism — they only save typing the same fixed text
+every dispatch.
 
 `heimr preamble <kind>` prints the standard harness-invocation preamble for a sealed dispatch,
 suitable as one `gardr run start --harness-arg` value:
@@ -53,17 +54,37 @@ Read /workspace/WORK.md and the sole sealed dispatch directory under /workspace/
 It names the fixed sandbox paths a worker reads (`/workspace/WORK.md`, the sole sealed dispatch
 directory under `/workspace/dispatches`, and that dispatch's `HANDOFF.json`) and the forge-access
 boundary (no Skald or Rata; direct `gh`/`az`; no `mcp__tools`). `heimr preamble review` prints the
-same preamble with a read-only closing instruction instead. All task-specific content still comes
-from `WORK.md` and the sealed dispatch itself, per the sandboxed-worker contract; the preamble
-carries no dispatch-specific detail because a Gardr-mounted sandbox always exposes exactly one
-sealed dispatch at those fixed paths.
+same preamble with a closing instruction not to modify the target repository or worktree; it does
+not claim the reviewer is read-only on the forge, since a reviewer posts PR review comments. All
+task-specific content still comes from `WORK.md` and the sealed dispatch itself, per the
+sandboxed-worker contract; the preamble carries no dispatch-specific detail because a
+Gardr-mounted sandbox always exposes exactly one sealed dispatch at those fixed paths.
 
-`heimr template <kind>` prints a `WORK.md` scaffold to fill in and pass to
-`heimr work set --from <file>`:
+`heimr template <kind>` prints a `WORK.md` scaffold with `{{token}}` placeholders that the caller
+(styrir) substitutes literally, to pass to `heimr work set --from <file>`. Unknown tokens are left
+as-is; there is no other templating.
 
-- `build` — goal, acceptance criteria, constraints, verification, deliverable.
-- `review` — frame, acceptance criteria, review checklist, an explicit read-only boundary, and
-  the expected `HANDOFF.json` shape.
+- `build` tokens: `title`, `ticket_id`, `tracker`, `acceptance_criteria`, `branch`, `trunk`,
+  `verify`, `pr_command`, `pr` (empty on the first build). Covers goal, acceptance criteria,
+  constraints, verification, deliverable, escalation, inbox, and PR threads.
+- `review` tokens: `title`, `ticket_id`, `acceptance_criteria`, `branch`, `trunk`, `pr`. Covers
+  frame (with an explicit read-only boundary on the worktree and ticket), review checklist, PR
+  review instructions, and the expected `HANDOFF.json` shape.
 
-Both templates and the preamble are documentation and text generation only: they do not read or
-write a workspace, and sealed dispatch immutability is unaffected.
+**Inbox.** A build dispatch may carry `inbox/*.handoff.json` (a prior dispatch's `HANDOFF.json`,
+byte-for-byte) and `inbox/*.md` (human notes); the build template tells the agent every file under
+`inbox/` is work addressed to it. Review dispatches never carry an inbox, and the review template
+never mentions one.
+
+**PR threads.** A reviewer posts exactly one `COMMENT` review with one inline thread per finding,
+each body prefixed `**<severity>**`, and never approves or requests changes on the forge itself. A
+builder reads every unresolved thread on its PR before acting, replies pointing at a commit or
+declines in one line, then resolves it. The PR wins over the inbox on conflict.
+
+**Handoff v1**, documented in full by `heimr docs`: a build handoff carries
+`{version, status, branch, commit, pr, summary, acceptance_criteria[], blockers[], escalation,
+threads[]}`; a review handoff carries `{version, status, verdict, summary, acceptance_criteria[],
+findings[]}`, each finding optionally carrying a `thread_url`.
+
+Templates, preamble, inbox, and PR threads are documentation and text generation only: they do not
+read or write a workspace, and sealed dispatch immutability is unaffected.

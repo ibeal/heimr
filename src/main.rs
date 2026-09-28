@@ -199,7 +199,28 @@ fn print_help() {
 
 fn print_docs() {
     println!(
-        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`, starting from `heimr template build` or `heimr template review`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Once a worker or orchestrator needs to push the prepared repository somewhere, attach an `origin` push remote with `heimr repo set-push-remote <workspace> --url <url>`. `repo prepare` always strips any clone-origin remote to keep the worktree self-contained, so this is the supported way to (re)attach one; it treats the URL as an opaque string (any forge, any scheme) and is safe to run again with a different URL, which just updates `origin` in place.\n5. Create a dispatch, add its inputs, then seal it.\n6. An orchestrator can consume its sealed handoff with `heimr dispatch handoff <workspace> <dispatch>`.\n7. Launch the sandboxed worker with `heimr preamble build` or `heimr preamble review` as the harness invocation preamble (for example, one `gardr run start --harness-arg` value).\n8. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and sealed dispatch inputs are immutable through Heimr. Sealing writes a mutable `HANDOFF.json` and a SHA-256 inventory of the immutable inputs in `dispatch.json`; `check` verifies that inventory. `dispatch handoff` verifies the inputs before printing the current `HANDOFF.json`.\n\n`preamble` and `template` are an interim home for dispatch-ergonomics scaffolding pending a dedicated Styrir interface; they add no new context-delivery mechanism and read no workspace state. Both require a `build` or `review` kind and work without a workspace root. `preamble <kind>` prints the standard sandboxed-worker preamble: it names `/workspace/WORK.md`, the sole sealed dispatch directory under `/workspace/dispatches`, that dispatch's `HANDOFF.json`, and the forge-access rule (no Skald or Rata, direct `gh`/`az`, no `mcp__tools`). `template <kind>` prints a WORK.md scaffold: `build` covers goal, acceptance criteria, constraints, verification, and deliverable; `review` covers frame, acceptance criteria, review checklist, an explicit read-only boundary, and the expected HANDOFF.json shape."
+        "# Agent Usage\n\nHeimr stores the stable inputs for one unit of agent work. It does not invoke agents, resolve context, or manage sandboxing.\n\n1. Create a workspace with `heimr new <workspace>`.\n2. Set its immutable work brief with `heimr work set <workspace> --from <file>`, starting from `heimr template build` or `heimr template review`.\n3. Prepare its detached repository worktree with `heimr repo prepare <workspace> --from <checkout>` or clone one with `heimr repo prepare <workspace> --url <git-url>`.\n4. Once a worker or orchestrator needs to push the prepared repository somewhere, attach an `origin` push remote with `heimr repo set-push-remote <workspace> --url <url>`. `repo prepare` always strips any clone-origin remote to keep the worktree self-contained, so this is the supported way to (re)attach one; it treats the URL as an opaque string (any forge, any scheme) and is safe to run again with a different URL, which just updates `origin` in place.\n5. Create a dispatch, add its inputs, then seal it.\n6. An orchestrator can consume its sealed handoff with `heimr dispatch handoff <workspace> <dispatch>`.\n7. Launch the sandboxed worker with `heimr preamble build` or `heimr preamble review` as the harness invocation preamble (for example, one `gardr run start --harness-arg` value).\n8. Run `heimr check <workspace>` before consuming a sealed dispatch.\n\nWorkspace commands default to `~/.heimr`; `--root <path>` and `HEIMR_ROOT` override it. `WORK.md` and sealed dispatch inputs are immutable through Heimr. Sealing writes a mutable `HANDOFF.json` and a SHA-256 inventory of the immutable inputs in `dispatch.json`; `check` verifies that inventory. `dispatch handoff` verifies the inputs before printing the current `HANDOFF.json`.\n\nHeimr owns the dispatch contract: what each agent role is told (`preamble`, `template`), and how one agent's handoff reaches the next (inbox files and PR threads, below). `preamble` and `template` add no new context-delivery mechanism and read no workspace state; they are text generation only. Both require a `build` or `review` kind and work without a workspace root. `preamble <kind>` prints the standard sandboxed-worker preamble: it names `/workspace/WORK.md`, the sole sealed dispatch directory under `/workspace/dispatches`, that dispatch's `HANDOFF.json`, and the forge-access rule (no Skald or Rata, direct `gh`/`az`, no `mcp__tools`). `preamble review` does not claim the reviewer is read-only on the forge: a reviewer posts PR review comments, it just must not modify the target repository or worktree.
+
+`template <kind>` prints a WORK.md scaffold with `{{{{token}}}}` placeholders that the caller (styrir) substitutes literally; unknown tokens are left as-is and no other templating happens. `template build` tokens: `title`, `ticket_id`, `tracker`, `acceptance_criteria`, `branch`, `trunk`, `verify`, `pr_command`, `pr` (empty on the first build of a ticket). `template review` tokens: `title`, `ticket_id`, `acceptance_criteria`, `branch`, `trunk`, `pr`. `build` covers goal, acceptance criteria, constraints, verification, deliverable, escalation, inbox, and PR threads. `review` covers frame (with an explicit read-only boundary on the worktree and ticket), review checklist, PR review instructions, and the expected HANDOFF.json shape.
+
+## Inbox convention
+
+A build dispatch may contain `inbox/*.handoff.json` (a prior dispatch's `HANDOFF.json`, copied
+byte-for-byte) and `inbox/*.md` (human notes). The build template tells the agent that every file
+under `inbox/` is work addressed to it, to be read before acting. Review dispatches never carry an
+inbox, and the review template never mentions one.
+
+## PR threads
+
+A reviewer posts exactly one `COMMENT` review on the PR with one inline thread per finding, each
+thread body prefixed `**<severity>**`; it never approves or requests changes on the forge itself.
+A builder reads every unresolved thread on its PR before acting, replies pointing at the commit
+that addresses it or declines it in one line, then resolves the thread. A human thread with no
+severity tag is treated as should-fix. The PR wins over the inbox when the two conflict.
+
+## Handoff v1
+
+Both shapes carry `\"version\":1`. A build handoff is `{{version:1, status: complete|partial|escalated, branch, commit, pr, summary, acceptance_criteria[{{criterion, status: done|partial|not-started, evidence}}], blockers[], escalation, threads[{{id, url, action: fixed|declined, commit, reply}}]}}`. A review handoff is `{{version:1, status, verdict: approve|request-changes, summary, acceptance_criteria[{{criterion, status: done|partial|missing, evidence}}], findings[{{severity: blocking|should-fix|nit, description, path, line, thread_url}}]}}`. `threads` and `thread_url` are optional additions; everything else is the shape already read by consumers today."
     );
 }
 
@@ -222,7 +243,9 @@ fn kind_arg(args: &[String]) -> Result<&str, String> {
 fn harness_preamble(kind: &str) -> Result<String, String> {
     let action = match kind {
         "build" => "Build the dispatched task.",
-        "review" => "Review the dispatched task. Do not modify the target repository or worktree.",
+        "review" => {
+            "Review the dispatched task. Do not modify the target repository or worktree; post findings as PR review comments instead."
+        }
         _ => return Err("kind must be build or review".to_owned()),
     };
     Ok(format!(
@@ -243,39 +266,61 @@ fn work_template(kind: &str) -> Result<String, String> {
 }
 
 const BUILD_WORK_TEMPLATE: &str = "\
-# <Task title>\n\n\
+# {{title}}\n\n\
 ## Goal\n\
-<What must be true when this task is done, and why it matters.>\n\n\
+Implement skald ticket {{ticket_id}} in this repository so that every acceptance criterion below holds.\n\
+Tracker: {{tracker}}\n\n\
 ## Acceptance criteria\n\
-- <Criterion 1>\n\
-- <Criterion 2>\n\n\
+{{acceptance_criteria}}\n\n\
 ## Constraints\n\
-<Anything the worker must not do, or must do a specific way: scope limits,\n\
-forbidden approaches, required conventions.>\n\n\
+- Change only this repository. A missing fact is a blocker to report in HANDOFF.json, not something to guess.\n\
+- Commit on branch `{{branch}}`, based off `{{trunk}}`; push it to `origin`.\n\
+- No plans, notes, or summaries in the repository: the diff is the deliverable.\n\
+- Commit subjects: `type(scope): description`, body wrapped at 72 columns, referencing {{ticket_id}}.\n\n\
 ## Verification\n\
-<Exact commands to run and what passing looks like: test suites, lint,\n\
-formatting, manual checks.>\n\n\
+```sh\n\
+{{verify}}\n\
+```\n\
+All of it must pass before the handoff is marked complete.\n\n\
 ## Deliverable\n\
-<What the worker must leave behind: a pushed branch, a PR, an updated\n\
-HANDOFF.json with per-criterion evidence, and anything else expected.>\n";
+- Branch `{{branch}}` pushed to origin.\n\
+- A draft PR opened with {{pr_command}} (body ≤ 10 lines: one sentence, ≤ 4 bullets, one \"Verified:\" line).\n\
+- HANDOFF.json kept current, shape:\n\
+  `{\"version\":1,\"status\":\"complete\"|\"partial\"|\"escalated\",\"branch\":\"…\",\"commit\":\"…\",\"pr\":\"<url>|null\",\"summary\":\"…\",\"acceptance_criteria\":[{\"criterion\":\"…\",\"status\":\"done\"|\"partial\"|\"not-started\",\"evidence\":\"…\"}],\"blockers\":[\"…\"],\"escalation\":\"…\"|null,\"threads\":[{\"id\":\"…\",\"url\":\"…\",\"action\":\"fixed\"|\"declined\",\"commit\":\"…\"|null,\"reply\":\"…\"}]}`\n\n\
+## Escalation\n\
+Try to resolve blockers yourself first. If a blocker cannot be resolved within this task's scope —\n\
+the acceptance criteria assume something untrue, a decision belongs to a human, a tool or network\n\
+policy makes a criterion impossible here — stop, commit and push what is sound, and set\n\
+`\"status\":\"escalated\"` with `\"escalation\"` stating the problem and the decision or change needed.\n\
+The ticket goes back to refining for a human; do not keep retrying or narrow the criteria yourself.\n\n\
+## Inbox\n\
+This dispatch may contain `inbox/*.handoff.json` (a prior dispatch's HANDOFF.json, byte-for-byte)\n\
+and `inbox/*.md` (human notes). Treat every file under `inbox/` as work addressed to you: read all\n\
+of it before acting.\n\n\
+## PR threads\n\
+Before acting, read every unresolved review thread on {{pr}}. For each, reply pointing at the\n\
+commit that addresses it, or decline it in one line, then resolve the thread. If the PR and the\n\
+inbox disagree, the PR wins. Record what you did as `threads[]` in HANDOFF.json.\n";
 
 const REVIEW_WORK_TEMPLATE: &str = "\
-# <Task title> (review)\n\n\
+# {{title}} (review)\n\n\
 ## Frame\n\
-<What was built and why, and the revision or diff under review. Do not\n\
-include the builder's prompt, journal, or handoff reasoning; the reviewer\n\
-works from the target revision and this brief alone.>\n\n\
+Branch `{{branch}}` implements skald ticket {{ticket_id}}. Review the worktree at the branch tip\n\
+against trunk `{{trunk}}` and the acceptance criteria below. The worktree and the ticket are\n\
+read-only: do not modify the target repository or worktree, and do not change ticket state.\n\n\
 ## Acceptance criteria\n\
-- <Criterion 1>\n\
-- <Criterion 2>\n\n\
+{{acceptance_criteria}}\n\n\
 ## Review checklist\n\
-- <Design, readability, correctness>\n\
-- <Production safety>\n\
-- <Fit against each acceptance criterion above>\n\n\
-## Read-only boundary\n\
-The reviewer must not modify the target repository or worktree, and must not\n\
-resolve the builder's PR threads or Skald state. Findings only.\n\n\
-## Expected HANDOFF.json shape\n\
-Record an outcome, blocking/should-fix/nit findings with `path:line` evidence,\n\
-and a verdict per acceptance criterion. Approve only when there are no\n\
-blocking or should-fix findings.\n";
+- Design / readability / correctness: fits the existing architecture, idiomatic, no correctness bugs.\n\
+- Production safety: failure modes, partial failure, concurrency, bad data, observability, rollback.\n\
+- AC fit: map each criterion to done / partial / missing; flag scope drift.\n\
+- Severity: blocking / should-fix / nit, each tied to `path:line`. Documentation findings are nits\n\
+  unless grossly misleading. A nit is genuinely optional.\n\
+- Verdict follows severity mechanically: approve only when there is nothing above nit.\n\n\
+## PR review\n\
+Post exactly one `COMMENT` review on {{pr}} with one inline thread per finding, each thread body\n\
+starting `**<severity>**`. Never approve or request changes on the forge itself — the verdict\n\
+belongs in HANDOFF.json. Record each finding's `thread_url` in HANDOFF.json.\n\n\
+## Deliverable\n\
+HANDOFF.json kept current, shape:\n\
+`{\"version\":1,\"status\":\"complete\",\"verdict\":\"approve\"|\"request-changes\",\"summary\":\"…\",\"acceptance_criteria\":[{\"criterion\":\"…\",\"status\":\"done\"|\"partial\"|\"missing\",\"evidence\":\"…\"}],\"findings\":[{\"severity\":\"blocking\"|\"should-fix\"|\"nit\",\"description\":\"…\",\"path\":\"…\",\"line\":0,\"thread_url\":\"…\"}]}`\n";
