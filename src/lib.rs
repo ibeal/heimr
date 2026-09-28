@@ -46,7 +46,7 @@ impl Workspace {
 
     pub fn set_work(&self, content: &[u8]) -> Result<()> {
         self.require_exists()?;
-        write_new(&self.work_path(), content)
+        write_replacing(&self.work_path(), content)
     }
 
     /// Prepares the workspace repository from an existing local checkout.
@@ -686,11 +686,7 @@ fn write_new(path: &Path, content: &[u8]) -> Result<()> {
     if path.exists() {
         return Err(format!("refusing to overwrite {}", path.display()));
     }
-    let temporary = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
+    let temporary = temporary_sibling(path);
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -708,4 +704,35 @@ fn write_new(path: &Path, content: &[u8]) -> Result<()> {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+/// Writes `content` to `path`, replacing any existing file. A synced
+/// temporary file is written in `path`'s own directory and then renamed
+/// over `path`, so a reader always sees either the prior contents or the
+/// full new contents, never a partial file. On failure the temporary file
+/// is removed and any existing `path` is left untouched.
+fn write_replacing(path: &Path, content: &[u8]) -> Result<()> {
+    let temporary = temporary_sibling(path);
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(io_error)?;
+        file.write_all(content).map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        fs::rename(&temporary, path).map_err(io_error)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn temporary_sibling(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
