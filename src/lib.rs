@@ -683,9 +683,6 @@ fn io_error(error: io::Error) -> String {
 }
 
 fn write_new(path: &Path, content: &[u8]) -> Result<()> {
-    if path.exists() {
-        return Err(format!("refusing to overwrite {}", path.display()));
-    }
     write_atomic(path, content, || {
         if path.exists() {
             return Err(format!("refusing to overwrite {}", path.display()));
