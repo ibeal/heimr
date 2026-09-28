@@ -810,11 +810,9 @@ fn preamble_names_the_fixed_sandbox_context_and_forge_boundary() {
         .args(["preamble", "review"])
         .output()
         .unwrap();
-    assert!(
-        String::from_utf8(review.stdout)
-            .unwrap()
-            .contains("Review the dispatched task")
-    );
+    let review = String::from_utf8(review.stdout).unwrap();
+    assert!(review.contains("Review the dispatched task"));
+    assert!(!review.contains("read-only"));
 
     let bogus = Command::new(env!("CARGO_BIN_EXE_heimr"))
         .args(["preamble", "bogus"])
@@ -842,6 +840,9 @@ fn template_scaffolds_match_the_documented_schema_per_kind() {
         "## Constraints",
         "## Verification",
         "## Deliverable",
+        "## Escalation",
+        "## Inbox",
+        "## PR threads",
     ] {
         assert!(
             build.contains(heading),
@@ -859,8 +860,8 @@ fn template_scaffolds_match_the_documented_schema_per_kind() {
         "## Frame",
         "## Acceptance criteria",
         "## Review checklist",
-        "## Read-only boundary",
-        "## Expected HANDOFF.json shape",
+        "## PR review",
+        "## Deliverable",
     ] {
         assert!(
             review.contains(heading),
@@ -878,6 +879,86 @@ fn template_scaffolds_match_the_documented_schema_per_kind() {
             .unwrap()
             .contains("kind must be build or review")
     );
+}
+
+#[test]
+fn build_and_review_templates_carry_exactly_the_contract_tokens() {
+    let build = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["template", "build"])
+        .output()
+        .unwrap();
+    let build = String::from_utf8(build.stdout).unwrap();
+    for token in [
+        "{{title}}",
+        "{{ticket_id}}",
+        "{{tracker}}",
+        "{{acceptance_criteria}}",
+        "{{branch}}",
+        "{{trunk}}",
+        "{{verify}}",
+        "{{pr_command}}",
+        "{{pr}}",
+    ] {
+        assert!(build.contains(token), "missing {token} in build template");
+    }
+
+    let review = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["template", "review"])
+        .output()
+        .unwrap();
+    let review = String::from_utf8(review.stdout).unwrap();
+    for token in [
+        "{{title}}",
+        "{{ticket_id}}",
+        "{{acceptance_criteria}}",
+        "{{branch}}",
+        "{{trunk}}",
+        "{{pr}}",
+    ] {
+        assert!(review.contains(token), "missing {token} in review template");
+    }
+    // Review has no verify/pr_command/tracker tokens: those are build-only.
+    for token in ["{{verify}}", "{{pr_command}}", "{{tracker}}"] {
+        assert!(
+            !review.contains(token),
+            "unexpected {token} in review template"
+        );
+    }
+}
+
+#[test]
+fn build_template_states_the_inbox_and_pr_thread_contract() {
+    let build = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["template", "build"])
+        .output()
+        .unwrap();
+    let build = String::from_utf8(build.stdout).unwrap();
+    assert!(build.contains("inbox/*.handoff.json"));
+    assert!(build.contains("inbox/*.md"));
+    assert!(build.contains("work addressed to you"));
+    assert!(build.contains("unresolved review thread"));
+    assert!(build.contains("reply pointing at the"));
+    assert!(build.contains("decline it in one line"));
+    assert!(build.contains("resolve the thread"));
+    assert!(build.contains("the PR wins") || build.contains("PR wins"));
+    assert!(build.contains("threads[]"));
+    assert!(build.contains("\"threads\":"));
+}
+
+#[test]
+fn review_template_states_the_pr_review_contract_and_omits_inbox() {
+    let review = Command::new(env!("CARGO_BIN_EXE_heimr"))
+        .args(["template", "review"])
+        .output()
+        .unwrap();
+    let review = String::from_utf8(review.stdout).unwrap();
+    assert!(review.contains("one `COMMENT` review"));
+    assert!(review.contains("one inline thread per finding"));
+    assert!(review.contains("**<severity>**"));
+    assert!(review.contains("Never approve or request changes on the forge"));
+    assert!(review.contains("read-only"));
+    assert!(review.contains("thread_url"));
+    assert!(!review.contains("inbox"));
 }
 
 #[test]
@@ -914,4 +995,7 @@ fn help_and_docs_do_not_require_a_workspace_root() {
     assert!(docs.contains("heimr check <workspace>"));
     assert!(docs.contains("heimr preamble build"));
     assert!(docs.contains("heimr template build"));
+    assert!(docs.contains("Handoff v1"));
+    assert!(docs.contains("inbox"));
+    assert!(docs.contains("thread_url"));
 }
