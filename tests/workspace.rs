@@ -26,7 +26,11 @@ fn stable_work_and_multiple_dispatches_are_independent() {
     let workspace = Workspace::open(&temp, "task").unwrap();
     workspace.create().unwrap();
     workspace.set_work(b"do the work\n").unwrap();
-    assert!(workspace.set_work(b"replace it").is_err());
+    workspace.set_work(b"replace it").unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.work_path()).unwrap(),
+        "replace it"
+    );
     workspace.new_dispatch("build").unwrap();
     workspace.new_dispatch("review").unwrap();
     workspace
@@ -53,6 +57,14 @@ fn stable_work_and_multiple_dispatches_are_independent() {
     )
     .unwrap();
     workspace.check().unwrap();
+    workspace
+        .set_work(b"revised acceptance criteria\n")
+        .unwrap();
+    workspace.check().unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.work_path()).unwrap(),
+        "revised acceptance criteria\n"
+    );
     assert_eq!(
         fs::read_to_string(
             workspace

@@ -18,7 +18,7 @@ heimr --root /workspaces dispatch seal ask-2026-09-02 build
 heimr --root /workspaces dispatch handoff ask-2026-09-02 build
 ```
 
-`work set` writes the one stable `WORK.md` and refuses replacement. `repo prepare` creates a detached Git worktree in `repository/` from the supplied checkout and is safe to repeat after validation. Repository guidance such as `repository/AGENTS.md` remains there.
+`work set` writes `WORK.md`, replacing any existing one; sealed dispatch inputs remain immutable. `repo prepare` creates a detached Git worktree in `repository/` from the supplied checkout and is safe to repeat after validation. Repository guidance such as `repository/AGENTS.md` remains there.
 
 `dispatch put` takes file content from `--from` or standard input and only accepts confined relative paths. A dispatch accepts any files before sealing. `dispatch seal` writes its immutable input inventory and SHA-256 digests to `dispatch.json` and adds that dispatch's mutable `HANDOFF.json`; `HANDOFF.json` is excluded from the inventory so workers can report progress. `dispatch handoff <workspace> <dispatch>` verifies the sealed inputs, then prints its current handoff, so an orchestrator need not discover the workspace path or read it directly. It rejects unknown or unsealed dispatches. `heimr check <workspace>` validates the workspace and every sealed dispatch inventory.
 
