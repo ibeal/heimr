@@ -691,11 +691,9 @@ fn write_new(path: &Path, content: &[u8]) -> Result<()> {
     })
 }
 
-/// Writes `content` to `path`, replacing any existing file. A synced
-/// temporary file is written in `path`'s own directory and then renamed
-/// over `path`, so a reader always sees either the prior contents or the
-/// full new contents, never a partial file. On failure the temporary file
-/// is removed and any existing `path` is left untouched.
+/// Writes `content` to `path`, replacing any existing file, via
+/// `write_atomic` with no overwrite precondition. See `write_atomic` for
+/// the atomicity and failure-handling guarantees.
 fn write_replacing(path: &Path, content: &[u8]) -> Result<()> {
     write_atomic(path, content, || Ok(()))
 }
