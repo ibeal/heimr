@@ -4,7 +4,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use heimr::Workspace;
+use heimr::{TemplateWorkspace, Workspace, list_workspaces};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn temporary_directory() -> PathBuf {
@@ -25,6 +25,8 @@ fn stable_work_and_multiple_dispatches_are_independent() {
     let temp = temporary_directory();
     let workspace = Workspace::open(&temp, "task").unwrap();
     workspace.create().unwrap();
+    let source = temporary_directory();
+    workspace.set_mounted_source(&source).unwrap();
     workspace.set_work(b"do the work\n").unwrap();
     workspace.set_work(b"replace it").unwrap();
     assert_eq!(
@@ -85,6 +87,7 @@ fn stable_work_and_multiple_dispatches_are_independent() {
         "review instructions"
     );
     fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(source).unwrap();
 }
 
 #[test]
@@ -92,6 +95,8 @@ fn rejects_escape_paths_and_detects_modified_sealed_content() {
     let temp = temporary_directory();
     let workspace = Workspace::open(&temp, "task").unwrap();
     workspace.create().unwrap();
+    let source = temporary_directory();
+    workspace.set_mounted_source(&source).unwrap();
     workspace.new_dispatch("build").unwrap();
     assert!(
         workspace
@@ -134,6 +139,7 @@ fn rejects_escape_paths_and_detects_modified_sealed_content() {
             .contains("inventory does not match")
     );
     fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(source).unwrap();
 }
 
 #[cfg(unix)]
@@ -785,12 +791,15 @@ fn check_detects_a_repository_with_external_git_metadata() {
             "HEAD",
         ],
     );
+    let mounted = temporary_directory();
+    workspace.set_mounted_source(&mounted).unwrap();
     let error = workspace.check().unwrap_err();
     assert!(
         error.contains("linked worktree") || error.contains("outside"),
         "{error}"
     );
     fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(mounted).unwrap();
 }
 
 #[test]
@@ -1016,4 +1025,404 @@ fn help_and_docs_do_not_require_a_workspace_root() {
     assert!(docs.contains("Handoff v1"));
     assert!(docs.contains("inbox"));
     assert!(docs.contains("thread_url"));
+}
+
+#[test]
+fn new_workspace_has_the_curated_template_and_mounted_source_plan() {
+    let temp = temporary_directory();
+    let source = temporary_directory();
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+
+    for path in [
+        "WORK.md",
+        "dispatches",
+        "environment/AGENTS.md",
+        "environment/task.md",
+        "environment/prompt.md",
+        "environment/context/INDEX.md",
+        "environment/manifest.json",
+        "state/HANDOFF.json",
+        "workspace.json",
+    ] {
+        assert!(workspace.root.join(path).exists(), "missing {path}");
+    }
+    assert!(
+        workspace
+            .mount_plan()
+            .unwrap_err()
+            .contains("source is not selected")
+    );
+    assert!(
+        workspace
+            .check()
+            .unwrap_err()
+            .contains("source is not selected")
+    );
+
+    assert!(
+        workspace
+            .set_mounted_source(&temp.join(".templates/default"))
+            .unwrap_err()
+            .contains("Heimr root")
+    );
+    assert!(Workspace::open(&temp, ".templates").is_err());
+    workspace.set_mounted_source(&source).unwrap();
+    workspace
+        .put_environment_file(PathBuf::from("AGENTS.md").as_path(), b"instructions\n")
+        .unwrap();
+    workspace
+        .put_environment_file(PathBuf::from("context/project.md").as_path(), b"context\n")
+        .unwrap();
+    workspace.check().unwrap();
+
+    let plan = serde_json::to_value(workspace.mount_plan().unwrap()).unwrap();
+    assert_eq!(plan["mounts"][0]["target"], "/repo");
+    assert_eq!(plan["mounts"][0]["read_only"], false);
+    assert_eq!(plan["mounts"][1]["target"], "/agent");
+    assert_eq!(plan["mounts"][1]["read_only"], true);
+    assert_eq!(plan["mounts"][2]["target"], "/agent-state");
+    assert_eq!(plan["mounts"][2]["read_only"], false);
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.environment_path().join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest["files"].as_array().unwrap().iter().any(|file| {
+        file["path"] == "context/project.md"
+            && file["sha256"]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64)
+    }));
+    assert!(manifest["files"].as_array().unwrap().iter().all(|file| {
+        file["path"]
+            .as_str()
+            .is_some_and(|path| !path.contains("HANDOFF"))
+    }));
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.workspace_record_path()).unwrap()).unwrap();
+    assert_eq!(record["template"]["name"], "default");
+    let template_manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(temp.join(".templates/default/environment/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record["template"]["environment"],
+        template_manifest["files"]
+    );
+    assert_eq!(record["source"]["kind"], "mounted");
+    assert_eq!(
+        record["source"]["path"],
+        source.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(record["environment"], manifest["files"]);
+
+    let missing = source.with_extension("missing");
+    fs::rename(&source, &missing).unwrap();
+    assert!(
+        workspace
+            .mount_plan()
+            .unwrap_err()
+            .contains("mounted source is not a directory")
+    );
+    fs::rename(&missing, &source).unwrap();
+    workspace.check().unwrap();
+
+    fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn named_template_workspaces_are_copied_and_isolated() {
+    let temp = temporary_directory();
+    let template = TemplateWorkspace::open(&temp, "rust").unwrap();
+    template.create().unwrap();
+    template
+        .put_environment_file(PathBuf::from("AGENTS.md").as_path(), b"rust instructions\n")
+        .unwrap();
+    template
+        .put_environment_file(PathBuf::from("context/tooling.md").as_path(), b"cargo\n")
+        .unwrap();
+    template.check().unwrap();
+
+    let first = Workspace::open(&temp, "first").unwrap();
+    first.create_from_template("rust").unwrap();
+    assert_eq!(
+        fs::read(first.environment_path().join("AGENTS.md")).unwrap(),
+        b"rust instructions\n"
+    );
+    assert_eq!(
+        fs::read(first.environment_path().join("context/tooling.md")).unwrap(),
+        b"cargo\n"
+    );
+
+    template
+        .put_environment_file(PathBuf::from("AGENTS.md").as_path(), b"new instructions\n")
+        .unwrap();
+    assert_eq!(
+        fs::read(first.environment_path().join("AGENTS.md")).unwrap(),
+        b"rust instructions\n"
+    );
+    first
+        .put_environment_file(PathBuf::from("AGENTS.md").as_path(), b"task override\n")
+        .unwrap();
+    assert_eq!(
+        fs::read(template.root.join("environment/AGENTS.md")).unwrap(),
+        b"new instructions\n"
+    );
+
+    let second = Workspace::open(&temp, "second").unwrap();
+    second.create_from_template("rust").unwrap();
+    assert_eq!(list_workspaces(&temp).unwrap(), vec!["first", "second"]);
+    assert_eq!(
+        fs::read(second.environment_path().join("AGENTS.md")).unwrap(),
+        b"new instructions\n"
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(second.workspace_record_path()).unwrap()).unwrap();
+    assert_eq!(record["template"]["name"], "rust");
+
+    fs::remove_file(template.root.join("environment/task.md")).unwrap();
+    let invalid = Workspace::open(&temp, "invalid").unwrap();
+    assert!(
+        invalid
+            .create_from_template("rust")
+            .unwrap_err()
+            .contains("invalid template workspace")
+    );
+    assert!(!invalid.root.exists());
+    assert!(
+        Workspace::open(&temp, "missing")
+            .unwrap()
+            .create_from_template("unknown")
+            .unwrap_err()
+            .contains("template workspace does not exist")
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn cli_populates_curated_inputs_and_emits_a_mount_plan() {
+    let temp = temporary_directory();
+    let source = temporary_directory();
+    let input = temp.join("input.md");
+    fs::write(&input, b"curated\n").unwrap();
+    let binary = env!("CARGO_BIN_EXE_heimr");
+    let root = temp.to_str().unwrap();
+
+    for args in [
+        vec!["--root", root, "new", "task"],
+        vec![
+            "--root",
+            root,
+            "source",
+            "mount",
+            "task",
+            "--from",
+            source.to_str().unwrap(),
+        ],
+        vec![
+            "--root",
+            root,
+            "environment",
+            "agents",
+            "task",
+            "--from",
+            input.to_str().unwrap(),
+        ],
+        vec![
+            "--root",
+            root,
+            "environment",
+            "context",
+            "task",
+            "--path",
+            "INDEX.md",
+            "--from",
+            input.to_str().unwrap(),
+        ],
+    ] {
+        let output = Command::new(binary).args(args).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    for args in [
+        vec!["--root", root, "workspace-template", "new", "custom"],
+        vec![
+            "--root",
+            root,
+            "workspace-template",
+            "environment",
+            "agents",
+            "custom",
+            "--from",
+            input.to_str().unwrap(),
+        ],
+        vec!["--root", root, "new", "templated", "--template", "custom"],
+    ] {
+        let output = Command::new(binary).args(args).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    assert_eq!(
+        fs::read(temp.join("templated/environment/AGENTS.md")).unwrap(),
+        b"curated\n"
+    );
+
+    let output = Command::new(binary)
+        .args(["--root", root, "mount-plan", "task"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["mounts"][1]["target"], "/agent");
+    assert_eq!(
+        fs::read(temp.join("task/environment/AGENTS.md")).unwrap(),
+        b"curated\n"
+    );
+    assert_eq!(
+        fs::read(temp.join("task/environment/context/INDEX.md")).unwrap(),
+        b"curated\n"
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn curated_environment_rejects_escapes_and_detects_invalid_templates() {
+    let temp = temporary_directory();
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    let source = temporary_directory();
+    workspace.set_mounted_source(&source).unwrap();
+    assert!(
+        workspace
+            .set_mounted_source(&workspace.root)
+            .unwrap_err()
+            .contains("worker-writable")
+    );
+    assert!(
+        workspace
+            .put_environment_file(PathBuf::from("context/../escape").as_path(), b"bad")
+            .unwrap_err()
+            .contains("confined")
+    );
+    assert!(
+        workspace
+            .put_environment_file(PathBuf::from("manifest.json").as_path(), b"bad")
+            .is_err()
+    );
+
+    fs::write(
+        workspace.state_path().join("HANDOFF.json"),
+        b"{\"status\":\"complete\"}\n",
+    )
+    .unwrap();
+    workspace.check().unwrap();
+    fs::remove_file(workspace.environment_path().join("task.md")).unwrap();
+    assert!(
+        workspace
+            .check()
+            .unwrap_err()
+            .contains("invalid workspace template")
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn legacy_workspace_migration_is_additive_and_idempotent() {
+    let temp = temporary_directory();
+    let workspace = Workspace::open(&temp, "legacy").unwrap();
+    fs::create_dir_all(workspace.dispatch_path("build").unwrap()).unwrap();
+    fs::write(workspace.work_path(), b"legacy brief\n").unwrap();
+    let legacy_handoff = workspace
+        .dispatch_path("build")
+        .unwrap()
+        .join("HANDOFF.json");
+    fs::write(&legacy_handoff, b"{\"status\":\"legacy\"}\n").unwrap();
+
+    workspace.check().unwrap();
+    workspace.migrate().unwrap();
+    workspace.migrate().unwrap();
+    workspace.check().unwrap();
+    assert_eq!(fs::read(workspace.work_path()).unwrap(), b"legacy brief\n");
+    assert_eq!(
+        fs::read(legacy_handoff).unwrap(),
+        b"{\"status\":\"legacy\"}\n"
+    );
+    assert_eq!(
+        fs::read(workspace.state_path().join("HANDOFF.json")).unwrap(),
+        b"{\n  \"version\": 1,\n  \"status\": \"pending\"\n}\n"
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn cloned_source_plan_uses_the_managed_repository_and_records_revision() {
+    let temp = temporary_directory();
+    let source = temp.join("source");
+    run_git(&temp, ["init", source.to_str().unwrap()]);
+    run_git(&source, ["config", "user.email", "heimr@example.test"]);
+    run_git(&source, ["config", "user.name", "Heimr Test"]);
+    fs::write(source.join("README.md"), "source\n").unwrap();
+    run_git(&source, ["add", "README.md"]);
+    run_git(&source, ["commit", "-m", "initial"]);
+
+    let workspace = Workspace::open(&temp, "task").unwrap();
+    workspace.create().unwrap();
+    workspace.prepare_repository(&source).unwrap();
+    workspace.check().unwrap();
+    let plan = serde_json::to_value(workspace.mount_plan().unwrap()).unwrap();
+    assert_eq!(
+        plan["mounts"][0]["source"],
+        workspace
+            .repository_path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.workspace_record_path()).unwrap()).unwrap();
+    assert_eq!(record["source"]["kind"], "cloned");
+    assert_eq!(
+        record["source"]["revision"],
+        git_stdout(&source, ["rev-parse", "HEAD"])
+    );
+    assert!(
+        workspace
+            .prepare_repository_url("https://example.test/different.git")
+            .unwrap_err()
+            .contains("refusing to relabel")
+    );
+    let mounted = temporary_directory();
+    assert!(
+        workspace
+            .set_mounted_source(&mounted)
+            .unwrap_err()
+            .contains("source is already selected")
+    );
+
+    run_git(&mounted, ["init"]);
+    run_git(&mounted, ["config", "user.email", "heimr@example.test"]);
+    run_git(&mounted, ["config", "user.name", "Heimr Test"]);
+    fs::write(mounted.join("README.md"), "mounted\n").unwrap();
+    run_git(&mounted, ["add", "README.md"]);
+    run_git(&mounted, ["commit", "-m", "mounted"]);
+    let mounted_first = Workspace::open(&temp, "mounted-first").unwrap();
+    mounted_first.create().unwrap();
+    mounted_first.set_mounted_source(&mounted).unwrap();
+    assert!(
+        mounted_first
+            .prepare_repository(&mounted)
+            .unwrap_err()
+            .contains("source is already selected")
+    );
+
+    fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(mounted).unwrap();
 }
