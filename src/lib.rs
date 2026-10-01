@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -15,19 +16,191 @@ pub struct Workspace {
     pub root: PathBuf,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase", tag = "kind")]
+pub enum WorkspaceSource {
+    Mounted {
+        path: String,
+        revision: Option<String>,
+    },
+    Cloned {
+        identity: String,
+        revision: String,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WorkspaceRecord {
+    version: u32,
+    #[serde(default)]
+    legacy: bool,
+    #[serde(default)]
+    template: Option<TemplateSelection>,
+    source: Option<WorkspaceSource>,
+    environment: Vec<InventoryEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TemplateSelection {
+    name: String,
+    environment: Vec<InventoryEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EnvironmentManifest {
+    version: u32,
+    files: Vec<InventoryEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MountPlan {
+    pub version: u32,
+    pub mounts: Vec<Mount>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Mount {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
+const ENVIRONMENT_FILES: [&str; 4] = ["AGENTS.md", "task.md", "prompt.md", "context/INDEX.md"];
+pub const DEFAULT_TEMPLATE: &str = "default";
+
+#[derive(Clone, Debug)]
+pub struct TemplateWorkspace {
+    pub root: PathBuf,
+    name: String,
+}
+
+impl TemplateWorkspace {
+    pub fn open(heimr_root: &Path, name: &str) -> Result<Self> {
+        validate_name("template name", name)?;
+        Ok(Self {
+            root: heimr_root.join(".templates").join(name),
+            name: name.to_owned(),
+        })
+    }
+
+    pub fn create(&self) -> Result<()> {
+        if self.root.exists() {
+            return Err(format!(
+                "template workspace already exists: {}",
+                self.root.display()
+            ));
+        }
+        fs::create_dir_all(self.environment_path().join("context")).map_err(io_error)?;
+        for relative in ENVIRONMENT_FILES {
+            write_new(&self.environment_path().join(relative), b"")?;
+        }
+        self.refresh_manifest()
+    }
+
+    pub fn put_environment_file(&self, relative_path: &Path, content: &[u8]) -> Result<()> {
+        self.require_exists()?;
+        let relative_path = validate_environment_path(relative_path)?;
+        ensure_confined_parent(&self.environment_path(), relative_path)?;
+        write_replacing(&self.environment_path().join(relative_path), content)?;
+        self.refresh_manifest()
+    }
+
+    pub fn check(&self) -> Result<()> {
+        self.require_exists()?;
+        validate_curated_environment(&self.environment_path())?;
+        Ok(())
+    }
+
+    fn environment_path(&self) -> PathBuf {
+        self.root.join("environment")
+    }
+
+    fn require_exists(&self) -> Result<()> {
+        if self.root.is_dir() {
+            Ok(())
+        } else {
+            Err(format!(
+                "template workspace does not exist: {}",
+                self.root.display()
+            ))
+        }
+    }
+
+    fn refresh_manifest(&self) -> Result<()> {
+        let files = environment_inventory(&self.environment_path())?;
+        write_environment_manifest(&self.environment_path(), &files)
+    }
+}
+
 impl Workspace {
     pub fn open(root: &Path, name: &str) -> Result<Self> {
         validate_name("workspace name", name)?;
+        if name == ".templates" {
+            return Err("workspace name is reserved for Heimr template storage".to_owned());
+        }
         Ok(Self {
             root: root.join(name),
         })
     }
 
     pub fn create(&self) -> Result<()> {
+        self.create_from_template(DEFAULT_TEMPLATE)
+    }
+
+    pub fn create_from_template(&self, template_name: &str) -> Result<()> {
         if self.root.exists() {
             return Err(format!("workspace already exists: {}", self.root.display()));
         }
-        fs::create_dir_all(self.root.join("dispatches")).map_err(io_error)
+        let heimr_root = self
+            .root
+            .parent()
+            .ok_or_else(|| "workspace has no Heimr root".to_owned())?;
+        let template = TemplateWorkspace::open(heimr_root, template_name)?;
+        if template_name == DEFAULT_TEMPLATE && !template.root.exists() {
+            template.create()?;
+        }
+        template.check()?;
+        let template_files = environment_inventory(&template.environment_path())?;
+        fs::create_dir_all(self.root.join("dispatches")).map_err(io_error)?;
+        let result = self.install_environment_template(
+            None,
+            false,
+            Some(TemplateSelection {
+                name: template.name.clone(),
+                environment: template_files,
+            }),
+            Some(&template.environment_path()),
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if !self.root.exists() => Err(error),
+            Err(error) => match fs::remove_dir_all(&self.root) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!(
+                    "{error}; additionally failed to remove partial workspace: {cleanup}"
+                )),
+            },
+        }
+    }
+
+    pub fn migrate(&self) -> Result<()> {
+        self.require_exists()?;
+        if self.workspace_record_path().exists() {
+            return self.validate_environment_template();
+        }
+        if self.environment_path().exists() || self.state_path().exists() {
+            return Err("legacy workspace has a partial curated template; remove or repair it before migration".to_owned());
+        }
+        let source = if self.repository_path().exists() {
+            validate_worktree(&self.repository_path())?;
+            Some(WorkspaceSource::Cloned {
+                identity: "unknown (migrated legacy repository)".to_owned(),
+                revision: repository_revision(&self.repository_path())?,
+            })
+        } else {
+            None
+        };
+        self.install_environment_template(source, true, None, None)
     }
 
     pub fn work_path(&self) -> PathBuf {
@@ -39,6 +212,15 @@ impl Workspace {
     pub fn dispatches_path(&self) -> PathBuf {
         self.root.join("dispatches")
     }
+    pub fn environment_path(&self) -> PathBuf {
+        self.root.join("environment")
+    }
+    pub fn state_path(&self) -> PathBuf {
+        self.root.join("state")
+    }
+    pub fn workspace_record_path(&self) -> PathBuf {
+        self.root.join("workspace.json")
+    }
     pub fn dispatch_path(&self, name: &str) -> Result<PathBuf> {
         validate_name("dispatch name", name)?;
         Ok(self.dispatches_path().join(name))
@@ -49,6 +231,94 @@ impl Workspace {
         write_replacing(&self.work_path(), content)
     }
 
+    pub fn set_mounted_source(&self, source: &Path) -> Result<()> {
+        self.require_new_style()?;
+        if !source.is_dir() {
+            return Err(format!(
+                "mounted source is not a directory: {}",
+                source.display()
+            ));
+        }
+        let source = source.canonicalize().map_err(io_error)?;
+        reject_heimr_root_overlap(&self.canonical_heimr_root()?, &source)?;
+        let source_path = path_string(&source)?;
+        match self.read_workspace_record()?.source {
+            None => self.update_source(Some(WorkspaceSource::Mounted {
+                path: source_path,
+                revision: try_repository_revision(&source),
+            })),
+            Some(WorkspaceSource::Mounted { path, .. }) if path == source_path => Ok(()),
+            Some(_) => Err(
+                "workspace source is already selected; recreate the workspace to select a different source"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    pub fn put_environment_file(&self, relative_path: &Path, content: &[u8]) -> Result<()> {
+        self.require_new_style()?;
+        let relative_path = validate_environment_path(relative_path)?;
+        let destination = self.environment_path().join(relative_path);
+        ensure_confined_parent(&self.environment_path(), relative_path)?;
+        write_replacing(&destination, content)?;
+        self.refresh_environment_metadata()
+    }
+
+    pub fn mount_plan(&self) -> Result<MountPlan> {
+        self.require_new_style()?;
+        self.validate_environment_template()?;
+        let record = self.read_workspace_record()?;
+        let repository = match record.source.ok_or_else(|| {
+            "workspace source is not selected; use `source mount` or `repo prepare`".to_owned()
+        })? {
+            WorkspaceSource::Mounted { path, .. } => {
+                let path = PathBuf::from(path);
+                if !path.is_dir() {
+                    return Err(format!(
+                        "mounted source is not a directory: {}",
+                        path.display()
+                    ));
+                }
+                let path = path.canonicalize().map_err(io_error)?;
+                reject_heimr_root_overlap(&self.canonical_heimr_root()?, &path)?;
+                path
+            }
+            WorkspaceSource::Cloned { .. } => {
+                if !self.repository_path().is_dir() {
+                    return Err(format!(
+                        "workspace repository does not exist: {}",
+                        self.repository_path().display()
+                    ));
+                }
+                validate_worktree(&self.repository_path())?;
+                self.repository_path().canonicalize().map_err(io_error)?
+            }
+        };
+        let root = self.root.canonicalize().map_err(io_error)?;
+        let environment = confined_directory(&root, &self.environment_path(), "environment")?;
+        let state = confined_directory(&root, &self.state_path(), "state")?;
+        Ok(MountPlan {
+            version: 1,
+            mounts: vec![
+                Mount {
+                    source: path_string(&repository)?,
+                    target: "/repo".to_owned(),
+                    read_only: false,
+                },
+                Mount {
+                    source: path_string(&environment)?,
+                    target: "/agent".to_owned(),
+                    read_only: true,
+                },
+                Mount {
+                    source: path_string(&state)?,
+                    target: "/agent-state".to_owned(),
+                    read_only: false,
+                },
+            ],
+        })
+    }
+
     /// Prepares the workspace repository from an existing local checkout.
     ///
     /// The prepared repository is always a fully self-contained clone: it
@@ -57,9 +327,6 @@ impl Workspace {
     /// detached commit, or itself a linked worktree.
     pub fn prepare_repository(&self, source: &Path) -> Result<()> {
         self.require_exists()?;
-        if self.repository_path().exists() {
-            return validate_worktree(&self.repository_path());
-        }
         let source = source.canonicalize().map_err(io_error)?;
         let commit = git_stdout(
             Command::new("git")
@@ -68,6 +335,11 @@ impl Workspace {
                 .args(["rev-parse", "HEAD"]),
             "failed to resolve source HEAD",
         )?;
+        if self.repository_path().exists() {
+            validate_worktree(&self.repository_path())?;
+            return self.validate_existing_clone_identity(&path_string(&source)?);
+        }
+        self.require_source_unselected()?;
         self.install_clone(|clone| {
             run_git(
                 Command::new("git")
@@ -85,14 +357,23 @@ impl Workspace {
                 "git checkout failed",
             )?;
             detach_from_clone_origin(clone)
-        })
+        })?;
+        if self.workspace_record_path().exists() {
+            self.update_source(Some(WorkspaceSource::Cloned {
+                identity: path_string(&source)?,
+                revision: commit,
+            }))?;
+        }
+        Ok(())
     }
 
     pub fn prepare_repository_url(&self, url: &str) -> Result<()> {
         self.require_exists()?;
         if self.repository_path().exists() {
-            return validate_worktree(&self.repository_path());
+            validate_worktree(&self.repository_path())?;
+            return self.validate_existing_clone_identity(url);
         }
+        self.require_source_unselected()?;
         self.install_clone(|clone| {
             run_git(
                 Command::new("git").args(["clone", url]).arg(clone),
@@ -106,7 +387,14 @@ impl Workspace {
                 "git checkout failed",
             )?;
             detach_from_clone_origin(clone)
-        })
+        })?;
+        if self.workspace_record_path().exists() {
+            self.update_source(Some(WorkspaceSource::Cloned {
+                identity: url.to_owned(),
+                revision: repository_revision(&self.repository_path())?,
+            }))?;
+        }
+        Ok(())
     }
 
     /// Sets (or updates) the workspace repository's `origin` push remote to
@@ -193,7 +481,7 @@ impl Workspace {
                 .map(|entry| format!(
                     "    {{\"path\": \"{}\", \"sha256\": \"{}\"}}",
                     json_escape(&entry.path),
-                    entry.digest
+                    entry.sha256
                 ))
                 .collect::<Vec<_>>()
                 .join(",\n")
@@ -212,6 +500,39 @@ impl Workspace {
 
     pub fn check(&self) -> Result<()> {
         self.require_exists()?;
+        if self.workspace_record_path().exists() {
+            self.validate_environment_template()?;
+            let record = self.read_workspace_record()?;
+            match record.source {
+                Some(WorkspaceSource::Mounted { path, .. }) => {
+                    let path = PathBuf::from(path);
+                    if !path.is_dir() {
+                        return Err(format!(
+                            "mounted source is not a directory: {}",
+                            path.display()
+                        ));
+                    }
+                    let path = path.canonicalize().map_err(io_error)?;
+                    reject_heimr_root_overlap(&self.canonical_heimr_root()?, &path)?;
+                }
+                Some(WorkspaceSource::Cloned { .. }) => {
+                    if !self.repository_path().is_dir() {
+                        return Err(format!(
+                            "workspace repository does not exist: {}",
+                            self.repository_path().display()
+                        ));
+                    }
+                    validate_worktree(&self.repository_path())?;
+                }
+                None if record.legacy => {}
+                None => {
+                    return Err(
+                        "workspace source is not selected; use `source mount` or `repo prepare`"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
         if !self.dispatches_path().is_dir() {
             return Err("workspace is missing dispatches/".to_owned());
         }
@@ -231,12 +552,190 @@ impl Workspace {
         Ok(())
     }
 
+    fn canonical_heimr_root(&self) -> Result<PathBuf> {
+        self.root
+            .parent()
+            .ok_or_else(|| "workspace has no Heimr root".to_owned())?
+            .canonicalize()
+            .map_err(io_error)
+    }
+
     fn require_exists(&self) -> Result<()> {
         if self.root.is_dir() {
             Ok(())
         } else {
             Err(format!("workspace does not exist: {}", self.root.display()))
         }
+    }
+
+    fn require_new_style(&self) -> Result<()> {
+        self.require_exists()?;
+        if self.workspace_record_path().is_file() {
+            Ok(())
+        } else {
+            Err(
+                "legacy workspace has no curated environment; run `heimr migrate <workspace>`"
+                    .to_owned(),
+            )
+        }
+    }
+
+    fn install_environment_template(
+        &self,
+        source: Option<WorkspaceSource>,
+        legacy: bool,
+        template: Option<TemplateSelection>,
+        template_environment: Option<&Path>,
+    ) -> Result<()> {
+        if !self.work_path().exists() {
+            write_new(&self.work_path(), b"")?;
+        }
+        if let Some(template_environment) = template_environment {
+            copy_curated_environment(template_environment, &self.environment_path())?;
+        } else {
+            fs::create_dir_all(self.environment_path().join("context")).map_err(io_error)?;
+            for relative in ENVIRONMENT_FILES {
+                let path = self.environment_path().join(relative);
+                if !path.exists() {
+                    write_new(&path, b"")?;
+                }
+            }
+        }
+        fs::create_dir_all(self.state_path()).map_err(io_error)?;
+        let handoff = self.state_path().join("HANDOFF.json");
+        if !handoff.exists() {
+            write_new(
+                &handoff,
+                b"{\n  \"version\": 1,\n  \"status\": \"pending\"\n}\n",
+            )?;
+        }
+        let files = environment_inventory(&self.environment_path())?;
+        self.write_environment_manifest(&files)?;
+        self.write_workspace_record(&WorkspaceRecord {
+            version: 1,
+            legacy,
+            template,
+            source,
+            environment: files,
+        })
+    }
+
+    fn refresh_environment_metadata(&self) -> Result<()> {
+        let files = environment_inventory(&self.environment_path())?;
+        self.write_environment_manifest(&files)?;
+        let mut record = self.read_workspace_record()?;
+        record.environment = files;
+        self.write_workspace_record(&record)
+    }
+
+    fn update_source(&self, source: Option<WorkspaceSource>) -> Result<()> {
+        let mut record = self.read_workspace_record()?;
+        record.source = source;
+        self.write_workspace_record(&record)
+    }
+
+    fn require_source_unselected(&self) -> Result<()> {
+        if self.workspace_record_path().exists() && self.read_workspace_record()?.source.is_some() {
+            Err(
+                "workspace source is already selected; recreate the workspace to select a different source"
+                    .to_owned(),
+            )
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_existing_clone_identity(&self, requested: &str) -> Result<()> {
+        if !self.workspace_record_path().exists() {
+            return Ok(());
+        }
+        match self.read_workspace_record()?.source {
+            Some(WorkspaceSource::Cloned { identity, .. }) if identity == requested => Ok(()),
+            Some(WorkspaceSource::Cloned { identity, .. }) => Err(format!(
+                "workspace repository was prepared from {identity}; refusing to relabel it as {requested}"
+            )),
+            _ => Err(
+                "workspace repository exists but is not the selected source; recreate the workspace to select that clone"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    fn read_workspace_record(&self) -> Result<WorkspaceRecord> {
+        let content = fs::read(self.workspace_record_path()).map_err(io_error)?;
+        serde_json::from_slice(&content).map_err(|error| format!("invalid workspace.json: {error}"))
+    }
+
+    fn write_workspace_record(&self, record: &WorkspaceRecord) -> Result<()> {
+        let content = serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?;
+        write_replacing(
+            &self.workspace_record_path(),
+            &[content, b"\n".to_vec()].concat(),
+        )
+    }
+
+    fn write_environment_manifest(&self, files: &[InventoryEntry]) -> Result<()> {
+        write_environment_manifest(&self.environment_path(), files)
+    }
+
+    fn validate_environment_template(&self) -> Result<()> {
+        let environment = self.environment_path();
+        let state = self.state_path();
+        let root = self.root.canonicalize().map_err(io_error)?;
+        for directory in [&environment, &environment.join("context"), &state] {
+            if !directory.is_dir() {
+                return Err(format!(
+                    "invalid workspace template: missing {}/",
+                    directory.display()
+                ));
+            }
+        }
+        confined_directory(&root, &environment, "environment")?;
+        confined_directory(&root, &state, "state")?;
+        if !self.workspace_record_path().exists() {
+            return Err("invalid workspace template: missing workspace.json".to_owned());
+        }
+        if !self.workspace_record_path().is_file()
+            || fs::symlink_metadata(self.workspace_record_path())
+                .map_err(io_error)?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(
+                "invalid workspace template: workspace.json must be a regular file".to_owned(),
+            );
+        }
+        for relative in ENVIRONMENT_FILES {
+            if !environment.join(relative).is_file() {
+                return Err(format!(
+                    "invalid workspace template: missing environment/{relative}"
+                ));
+            }
+        }
+        if !state.join("HANDOFF.json").is_file() {
+            return Err("invalid workspace template: missing state/HANDOFF.json".to_owned());
+        }
+        let files = environment_inventory(&environment)?;
+        let manifest: EnvironmentManifest =
+            serde_json::from_slice(&fs::read(environment.join("manifest.json")).map_err(io_error)?)
+                .map_err(|error| format!("invalid environment/manifest.json: {error}"))?;
+        let record = self.read_workspace_record()?;
+        if manifest.version != 1
+            || record.version != 1
+            || manifest.files != files
+            || record.environment != files
+        {
+            return Err("curated environment inventory does not match its metadata".to_owned());
+        }
+        match &record.template {
+            Some(template) => {
+                validate_name("template name", &template.name)?;
+                validate_inventory_entries(&template.environment)?;
+            }
+            None if record.legacy => {}
+            None => return Err("workspace metadata is missing template provenance".to_owned()),
+        }
+        Ok(())
     }
 
     fn create_clone_staging_directory(&self) -> Result<PathBuf> {
@@ -277,10 +776,94 @@ impl Workspace {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct InventoryEntry {
     path: String,
-    digest: String,
+    sha256: String,
+}
+
+fn environment_inventory(directory: &Path) -> Result<Vec<InventoryEntry>> {
+    let mut files = Vec::new();
+    collect_files(directory, directory, &mut files)?;
+    files.retain(|entry| entry.path != "manifest.json");
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn validate_inventory_entries(files: &[InventoryEntry]) -> Result<()> {
+    let mut previous: Option<&str> = None;
+    for entry in files {
+        validate_environment_path(Path::new(&entry.path))?;
+        if previous.is_some_and(|value| value >= entry.path.as_str())
+            || entry.sha256.len() != 64
+            || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(
+                "template provenance contains an invalid curated-input inventory".to_owned(),
+            );
+        }
+        previous = Some(&entry.path);
+    }
+    Ok(())
+}
+
+fn write_environment_manifest(directory: &Path, files: &[InventoryEntry]) -> Result<()> {
+    let content = serde_json::to_vec_pretty(&EnvironmentManifest {
+        version: 1,
+        files: files.to_vec(),
+    })
+    .map_err(|error| error.to_string())?;
+    write_replacing(
+        &directory.join("manifest.json"),
+        &[content, b"\n".to_vec()].concat(),
+    )
+}
+
+fn validate_curated_environment(directory: &Path) -> Result<Vec<InventoryEntry>> {
+    if !directory.is_dir() || !directory.join("context").is_dir() {
+        return Err(format!(
+            "invalid template workspace: missing curated environment directories under {}",
+            directory.display()
+        ));
+    }
+    for relative in ENVIRONMENT_FILES {
+        if !directory.join(relative).is_file() {
+            return Err(format!(
+                "invalid template workspace: missing environment/{relative}"
+            ));
+        }
+    }
+    let files = environment_inventory(directory)?;
+    let manifest: EnvironmentManifest =
+        serde_json::from_slice(&fs::read(directory.join("manifest.json")).map_err(io_error)?)
+            .map_err(|error| format!("invalid template environment/manifest.json: {error}"))?;
+    if manifest.version != 1 || manifest.files != files {
+        return Err(
+            "template curated environment inventory does not match its manifest".to_owned(),
+        );
+    }
+    Ok(files)
+}
+
+fn copy_curated_environment(source: &Path, destination: &Path) -> Result<()> {
+    let files = validate_curated_environment(source)?;
+    fs::create_dir_all(destination.join("context")).map_err(io_error)?;
+    for entry in &files {
+        let relative = Path::new(&entry.path);
+        validate_environment_path(relative)?;
+        ensure_confined_parent(destination, relative)?;
+        write_new(
+            &destination.join(relative),
+            &fs::read(source.join(relative)).map_err(io_error)?,
+        )?;
+    }
+    let copied = environment_inventory(destination)?;
+    if copied != files {
+        return Err(
+            "template workspace changed while its curated environment was copied".to_owned(),
+        );
+    }
+    write_environment_manifest(destination, &copied)
 }
 
 fn inventory(directory: &Path) -> Result<Vec<InventoryEntry>> {
@@ -302,7 +885,7 @@ fn collect_files(base: &Path, directory: &Path, files: &mut Vec<InventoryEntry>)
             if relative != Path::new("dispatch.json") && relative != Path::new("HANDOFF.json") {
                 files.push(InventoryEntry {
                     path: path_to_slashes(relative)?,
-                    digest: sha256_file(&path)?,
+                    sha256: sha256_file(&path)?,
                 });
             }
         } else if !kind.is_file() {
@@ -335,7 +918,7 @@ fn verify_dispatch(directory: &Path, record: &Path) -> Result<()> {
             .map(|entry| format!(
                 "    {{\"path\": \"{}\", \"sha256\": \"{}\"}}",
                 json_escape(&entry.path),
-                entry.digest
+                entry.sha256
             ))
             .collect::<Vec<_>>()
             .join(",\n")
@@ -560,7 +1143,7 @@ pub fn list_workspaces(root: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for entry in fs::read_dir(root).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
-        if entry.file_type().map_err(io_error)?.is_dir() {
+        if entry.file_type().map_err(io_error)?.is_dir() && entry.file_name() != ".templates" {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -601,6 +1184,58 @@ pub fn validate_relative_path(path: &Path) -> Result<&Path> {
         Err("dispatch path must be a confined relative path".to_owned())
     } else {
         Ok(path)
+    }
+}
+
+fn validate_environment_path(path: &Path) -> Result<&Path> {
+    validate_relative_path(path).map_err(|_| "environment path must be confined".to_owned())?;
+    let value = path_to_slashes(path)?;
+    if matches!(value.as_str(), "AGENTS.md" | "task.md" | "prompt.md")
+        || value.starts_with("context/")
+    {
+        Ok(path)
+    } else {
+        Err("environment path must be AGENTS.md, task.md, prompt.md, or below context/".to_owned())
+    }
+}
+
+fn path_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))
+}
+
+fn repository_revision(path: &Path) -> Result<String> {
+    git_stdout(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"]),
+        "failed to resolve repository HEAD",
+    )
+}
+
+fn try_repository_revision(path: &Path) -> Option<String> {
+    repository_revision(path).ok()
+}
+
+fn reject_heimr_root_overlap(heimr_root: &Path, source: &Path) -> Result<()> {
+    if heimr_root.starts_with(source) || source.starts_with(heimr_root) {
+        Err("mounted source overlaps the Heimr root and would expose workspace or template metadata as worker-writable".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn confined_directory(root: &Path, path: &Path, label: &str) -> Result<PathBuf> {
+    let path = path.canonicalize().map_err(io_error)?;
+    if path.is_dir() && path.starts_with(root) {
+        Ok(path)
+    } else {
+        Err(format!(
+            "{label} directory escapes the workspace: {}",
+            path.display()
+        ))
     }
 }
 

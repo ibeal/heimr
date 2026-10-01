@@ -1,17 +1,28 @@
 # Heimr
 
-Heimr is a durable, tool-agnostic CLI for agent workspaces. It stores work and dispatch inputs; it does not invoke agents, resolve contexts, or manage sandboxing.
+Heimr is a durable, tool-agnostic CLI for agent workspaces. It stores work, curated agent inputs, source selection, state, and legacy dispatch data; it does not invoke agents, resolve contexts, or manage sandboxing.
 
 Workspaces are stored in `~/.heimr` by default. Set `HEIMR_ROOT`, or pass `--root <directory>` to override it.
 
 Run `heimr help` to list commands. `heimr docs` prints the agent-facing workspace lifecycle and its invariants; neither command requires a workspace root.
 
 ```sh
-heimr --root /workspaces new ask-2026-09-02
+# Define a reusable curated environment under /workspaces/.templates/rust:
+heimr --root /workspaces workspace-template new rust
+heimr --root /workspaces workspace-template environment agents rust --from AGENTS.md
+heimr --root /workspaces workspace-template environment task rust --from task.md
+heimr --root /workspaces workspace-template environment prompt rust --from prompt.md
+heimr --root /workspaces workspace-template environment context rust --path INDEX.md --from rata-output.md
+# Every workspace starts as an independent copy of its selected template:
+heimr --root /workspaces new ask-2026-09-02 --template rust
 heimr --root /workspaces work set ask-2026-09-02 --from work.md
-heimr --root /workspaces repo prepare ask-2026-09-02 --from /checkout
-# or clone a remote repository
+# Target an existing directory without copying it:
+heimr --root /workspaces source mount ask-2026-09-02 --from /checkout
+# Or create a self-contained managed clone:
 heimr --root /workspaces repo prepare ask-2026-09-02 --url https://github.com/example/project.git
+# Optional per-workspace override after copying the template:
+heimr --root /workspaces environment prompt ask-2026-09-02 --from task-specific-prompt.md
+heimr --root /workspaces mount-plan ask-2026-09-02
 heimr --root /workspaces dispatch new ask-2026-09-02 build
 heimr --root /workspaces dispatch put ask-2026-09-02 build --path AGENTS.md --from build-agents.md
 heimr --root /workspaces dispatch seal ask-2026-09-02 build
@@ -24,16 +35,24 @@ heimr --root /workspaces dispatch handoff ask-2026-09-02 build
 
 ```text
 <root>/<workspace>/
-├── WORK.md
-├── repository/                 # prepared checkout, including repository/AGENTS.md
-└── dispatches/
-    └── <dispatch>/
-        ├── AGENTS.md           # optional, dispatch-specific input
-        ├── HANDOFF.json        # created by seal
-        └── dispatch.json       # inventory + SHA-256 digests
+├── WORK.md                     # retained work brief
+├── repository/                 # managed clone, when selected
+├── dispatches/                 # retained legacy dispatches and handoffs
+├── environment/
+│   ├── AGENTS.md
+│   ├── task.md
+│   ├── prompt.md
+│   ├── context/INDEX.md
+│   └── manifest.json           # curated-input SHA-256 inventory
+├── state/HANDOFF.json
+└── workspace.json              # source identity/revision and environment digests
 ```
 
-Gardr can mount the workspace broadly, mount `repository/` beneath the execution root, and overlay the selected dispatch's `AGENTS.md` at that root. This preserves repository-local guidance while each dispatch supplies its own top-level instructions and handoff.
+Named template workspaces live below `<root>/.templates/`. `new` copies the selected template's entire confined `environment/` tree and records its name and digests; later template edits cannot mutate an existing workspace. If no template is named, Heimr materializes and uses the documented blank `default` template. `workspace-template check` validates a template before use.
+
+`mount-plan` validates and prints the machine-readable Gardr/Styrir boundary: the selected existing directory or managed clone is writable `/repo`, `environment/` is read-only `/agent`, and `state/` is writable `/agent-state`. The plan never mounts `workspace.json` or `environment/manifest.json` as writable. `heimr check` verifies template shape, source metadata, confinement, digests, the state handoff, repositories, and legacy dispatch inventories.
+
+`workspace-template environment` populates reusable inputs; `environment agents`, `task`, and `prompt` replace the copied files for one workspace. Both forms support `context --path <relative>` only below `context/`; paths cannot escape. Inputs can be caller files or output captured from existing Rata commands. `heimr migrate <workspace>` adds the curated directories and metadata to a legacy workspace without changing `WORK.md`, `repository/`, `dispatches/`, or legacy handoffs; repeating it is safe.
 
 ## Dispatch contract: preamble, template, inbox, PR threads
 
